@@ -16,10 +16,9 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from threading import Thread
 from typing import TYPE_CHECKING, Any
 
@@ -603,40 +602,17 @@ def build_local_balancing_dataloader(
         Iteration returns device-ready batches. last_host_batch retains the CPU
         view for metering without a device-to-host copy.
     """
-    error = None
-    identity = None
-    device_prefetch = None
-    try:
-        cost_model = resolve_cost_model(cost_model, model_config)
-        balancing_algorithm = resolve_balancing_algorithm(balancing_algorithm)
-        device = _resolve_device(device, communication_backend=config.communication_backend)
-        device_prefetch = _create_device_prefetcher(device, move_fn)
-        if not all(callable(callback) for callback in (metadata_fn, pack_fn, collate_fn)):
-            raise ValueError("metadata_fn, pack_fn and collate_fn must be callable.")
-        if not hasattr(local_dataloader, "__iter__"):
-            raise ValueError("local_dataloader must be iterable.")
-        if config.dataset_reader_ranks is not None or config.planner_rank is not None:
-            raise ValueError("Node-local balancing assigns readers and planners automatically.")
-        PackingConstraints(config.seq_len, config.oversized_policy, config.packing_budgets)
-        identity = json.dumps({
-            "config": asdict(config),
-            "policies": {
-                name: {
-                    "implementation": (
-                        f"{policy.__module__}.{getattr(policy, '__qualname__', type(policy).__qualname__)}"
-                    ),
-                    "version": getattr(policy, field_name, None),
-                }
-                for name, policy, field_name in (
-                    ("cost_model", cost_model, "model_id"),
-                    ("balancing_algorithm", balancing_algorithm, "algorithm_id"),
-                )
-            },
-            "max_steps": max_steps,
-            "device_type": None if device_prefetch is None else device_prefetch.device.type,
-        }, sort_keys=True)
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
+    cost_model = resolve_cost_model(cost_model, model_config)
+    balancing_algorithm = resolve_balancing_algorithm(balancing_algorithm)
+    device = _resolve_device(device, communication_backend=config.communication_backend)
+    device_prefetch = _create_device_prefetcher(device, move_fn)
+    if not all(callable(callback) for callback in (metadata_fn, pack_fn, collate_fn)):
+        raise ValueError("metadata_fn, pack_fn and collate_fn must be callable.")
+    if not hasattr(local_dataloader, "__iter__"):
+        raise ValueError("local_dataloader must be iterable.")
+    if config.dataset_reader_ranks is not None or config.planner_rank is not None:
+        raise ValueError("Node-local balancing assigns readers and planners automatically.")
+    PackingConstraints(config.seq_len, config.oversized_policy, config.packing_budgets)
     communication_device = None
     if config.communication_backend == "hccl":
         communication_device = device_prefetch.device if device_prefetch is not None else device
@@ -644,8 +620,6 @@ def build_local_balancing_dataloader(
         mesh,
         dp_dim_names=config.dp_dim_names,
         balance_group_size=config.balance_group_size,
-        build_identity=identity,
-        local_error=error,
         communication_backend=config.communication_backend,
         communication_device=communication_device,
     )
