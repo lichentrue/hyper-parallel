@@ -190,7 +190,7 @@ class TextParallelBatch:
             tokenizer: Tokenizer providing EOD and padding token semantics.
             data_config: Dataset options used to build runtime LTR fields.
             pp_shared_data: Whether pipeline stages share the prepared batch.
-            source_type: ``online`` or ``indexed`` DataLoader batch contract.
+            source_type: ``online``, ``indexed``, or ``indexed_source`` batch contract.
             attention_mode: ``dense`` or ``compressed`` attention representation.
             preserve_loss_mask: Preserve explicit Dataset weights and their dtype.
             causal: Whether attention uses left-to-right causal semantics.
@@ -220,7 +220,7 @@ class TextParallelBatch:
         self.runtime_input_adapter = runtime_input_adapter
         self._batch_flow_logged = False
 
-        if source_type == "online":
+        if source_type in {"online", "indexed_source"}:
             self.boundary_resolver = OnlineBoundaryResolver()
             self.source_input_field = "input_ids"
         elif source_type == "indexed":
@@ -233,17 +233,30 @@ class TextParallelBatch:
         self.pp_shared_data = pp_shared_data
         self.labels_are_shifted = bool(self.data_config.get("labels_are_shifted", True))
         self.preserve_loss_mask = preserve_loss_mask or bool(self.data_config.get("preserve_loss_mask", False))
+        if source_type == "indexed_source" and not self.labels_are_shifted:
+            raise ValueError("Indexed source packing produces shifted labels; labels_are_shifted must be True")
         create_attention_mask = bool(
             self.data_config.get("create_attention_mask_in_dataloader", attention_mode == "dense")
         )
+        if source_type == "indexed_source" and (
+                not create_attention_mask
+                or (attention_mode == "compressed" and runtime_input_adapter is None)
+        ):
+            raise ValueError(
+                "Indexed source packing requires document-boundary attention: enable "
+                "create_attention_mask_in_dataloader and supply a runtime_input_adapter for compressed attention"
+            )
         self.cp_sharder = CPBatchSharder(self.parallel_context)
         self.tp_broadcaster = TPBatchBroadcaster(self.parallel_context, device)
 
-        self.reset_position_ids = reset_position_ids or bool(self.data_config.get("reset_position_ids", False))
+        self.reset_position_ids = (
+            reset_position_ids or bool(self.data_config.get("reset_position_ids", False))
+            or source_type == "indexed_source"
+        )
         resolved_reset_attention_mask = (
             reset_attention_mask
             or bool(self.data_config.get("reset_attention_mask", False))
-            or source_type == "online"
+            or source_type in {"online", "indexed_source"}
         )
         self.eod_mask_loss = eod_mask_loss or bool(self.data_config.get("eod_mask_loss", False))
         self.attention_runtime = AttentionRuntime(
@@ -353,7 +366,12 @@ class TextParallelBatch:
 
     def _read_source_batch(self, data_iterator: Any) -> Mapping[str, Any] | None:
         """Read one complete batch on TP rank zero of each CP coordinate."""
-        if self.parallel_context.build_on_rank():
+        dataloader = getattr(data_iterator, "dataloader", None)
+        collective_source = bool(
+            getattr(data_iterator, "collective_source", False)
+            or getattr(dataloader, "collective_source", False)
+        )
+        if collective_source or self.parallel_context.build_on_rank():
             source_batch = next(data_iterator)
         else:
             source_batch = None
