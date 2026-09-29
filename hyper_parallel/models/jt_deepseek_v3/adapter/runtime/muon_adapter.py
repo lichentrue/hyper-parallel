@@ -82,7 +82,11 @@ def _configure(model: torch.nn.Module, optimizer: Any, *, qk_clip_threshold: flo
     """Bind local parameter layouts and register model-owned update hooks."""
     torch_npu.npu.set_compile_mode(jit_compile=False)
     torch.use_deterministic_algorithms(True)
-    bind_local_parameters(model, optimizer, replicated_names=model.jt_replicated_names)
+    # TP/EP uses planner source layouts to expose local DTensor optimizer views.
+    # Pure DP keeps replicated parameters as ordinary local leaves, so there is
+    # no source-layout table to bind and the public optimizer owns them directly.
+    if getattr(model, "source_shard_info", None) is not None:
+        bind_local_parameters(model, optimizer, replicated_names=model.jt_replicated_names)
     optimizer.optimizers_dict["muon"].ns_transform_fn = partial(projection_transform, model.config)
     optimizer.chained_optimizers[-1].register_step_post_hook(partial(_after_update, model, qk_clip_threshold))
     model.jt_optimizer_metrics = {}

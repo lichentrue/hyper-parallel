@@ -69,6 +69,8 @@ def _has_explicit_ep_override(overrides: dict[str, Any], fqn: str) -> bool:
 
 def _with_model_ep_overrides(distributed_setup: Any, config: DeepseekV32Config) -> Any:
     """Add only missing configured MoE EP factories as explicit model FQNs."""
+    if int(getattr(distributed_setup.mesh_context, "ep_size", 1)) <= 1:
+        return distributed_setup
     overrides = dict(getattr(distributed_setup, "plan_overrides", None) or {})
     for fqn in _configured_moe_fqns(config):
         if _has_explicit_ep_override(overrides, fqn):
@@ -155,10 +157,11 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path, sou
     arrays, _, conversion = convert_reference(reference_weights, config, source_tp_size=source_tp_size)
     setup = _with_model_ep_overrides(distributed_setup, config)
     mesh = setup.mesh_context
-    if (mesh.tp_size, mesh.ep_size, mesh.cp_size, mesh.dp_size, mesh.pp_size) != (8, 8, 1, 1, 1):
-        raise ValueError("JT recipe requires TP8/EP8 and DP/CP/PP1")
-    if not mesh.sequence_parallel or not mesh.loss_parallel:
-        raise ValueError("JT recipe requires sequence_parallel and loss_parallel")
+    topology = (mesh.tp_size, mesh.ep_size, mesh.cp_size, mesh.dp_size, mesh.pp_size)
+    if topology not in ((8, 8, 1, 1, 1), (1, 1, 1, 8, 1)):
+        raise ValueError("JT recipe requires either TP8/EP8/DP1 or DP8/TP1/EP1")
+    if mesh.tp_size > 1 and (not mesh.sequence_parallel or not mesh.loss_parallel):
+        raise ValueError("JT TP8/EP8 recipe requires sequence_parallel and loss_parallel")
 
     with torch.device("meta"):
         model = JTDeepseekV3ForCausalLM(config)
@@ -175,10 +178,22 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path, sou
     expected, logical_groups = _load_reference_state(model, arrays)
 
     framework_setup = replace(setup, module_replacements=())
+    if topology == (1, 1, 1, 8, 1) and framework_setup.strategy_config is not None:
+        # DP8 keeps complete local parameters so JT's fused MLA weights can
+        # perform model-owned slices; HSDP still synchronizes their gradients.
+        strategy_config = replace(
+            framework_setup.strategy_config,
+            replicate_params=[name for name, _ in model.named_parameters()],
+        )
+        framework_setup = replace(framework_setup, strategy_config=strategy_config)
 
     # Replacements have already shaped the reference state, so do not apply them a second time.
     planner, fsdp = instantiate_infrastructure(distributed_setup=framework_setup)
-    device = torch.device(mesh.device_mesh.device_type, torch.distributed.get_rank() % mesh.tp_size)
+    device_type = mesh.device_mesh.device_type
+    if device_type == "cpu":
+        device = torch.device("cpu")
+    else:
+        device = torch.device(device_type, getattr(torch, device_type).current_device())
     model.to(device)
     model.loss_group = mesh.device_mesh["tp"].get_group()
     global_shapes = {name: tuple(value.shape) for name, value in model.named_parameters()}

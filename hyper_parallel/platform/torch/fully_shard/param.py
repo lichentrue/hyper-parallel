@@ -307,6 +307,11 @@ class TorchHSDPParamV2(HSDPParamV2):
         if (
             isinstance(self.mesh_info, FSDPMeshInfo)
             and self._spmd_shard_mesh_dim is not None
+            # A shard axis of size one owns the complete dimension.  Keeping
+            # a Shard placement for that degenerate axis leaks an artificial
+            # ``fsdp_shard`` layout into model code (e.g. split/reshape),
+            # although no data is actually distributed on it.
+            and self.mesh_info.shard_mesh_size > 1
         ):
             # If TP/EP already shards the same tensor dimension, fully_shard must
             # use StridedShard so the unified placement preserves the intended
@@ -853,7 +858,12 @@ class TorchHSDPParamV2(HSDPParamV2):
     @property
     def unsharded_param(self) -> nn.Parameter:
         """Return the full unsharded parameter after all-gather."""
-        return self._unsharded_param
+        # A parameter that was not reached by the current forward path can
+        # have communication storage allocated by prefetch without ever
+        # materializing the stable unsharded wrapper.  Such a parameter has
+        # no unsharded gradient to reduce; returning the sharded leaf keeps
+        # the post-backward skip checks side-effect free.
+        return getattr(self, "_unsharded_param", self.sharded_param)
 
     @property
     def unsharded_grad_data(self) -> torch.Tensor:

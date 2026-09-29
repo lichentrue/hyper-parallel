@@ -119,7 +119,7 @@ training:
   train_iters: 10
   lr_scheduler_iters: 8
   max_grad_norm: 1.0
-  global_batch_size: 1
+  global_batch_size: 8
   micro_batch_size: 1
   backend: hccl
   init_device: cpu
@@ -127,21 +127,25 @@ training:
   # The configured model adapter retains the NPU execution policy.
   enable_full_determinism: false
 accelerator:
-  tp_size: 8
-  ep_size: 8
+  tp_size: 1
+  ep_size: 1
   cp_size: 1
   pp_size: 1
-  sequence_parallel: true
-  loss_parallel: true
+  sequence_parallel: false
+  loss_parallel: false
 fsdp_config:
   dp_shard_size: 1
 activation_checkpoint:
   mode: "off"
 activation_swap: none
 dataset:
-  _target_: hyper_parallel.data.indexed.supervised_dataset.IndexedSupervisedDataset
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.jt_dataset.build_jt_supervised_dataset
   data_path: /path/to/supervised_prefix
   sequence_length: 262144
+  data_config:
+    packing_stage: dataset
+    load_balance: native_batch_sampler
+    seq_length: 262144
   model_assets:
     tokenizer: null
   data_transform: null

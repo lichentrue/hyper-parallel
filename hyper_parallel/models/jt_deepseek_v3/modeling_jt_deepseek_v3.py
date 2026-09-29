@@ -44,7 +44,23 @@ from hyper_parallel.components.functional.npu_fusion_attention import (
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
 from hyper_parallel.components.losses._vocab_parallel_cross_entropy import vocab_parallel_cross_entropy_local
 from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel_mesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.models.replacement import module_replacement
+
+
+def _is_effectively_replicated(value: torch.Tensor) -> bool:
+    """Return whether a tensor has no data split across a mesh axis."""
+    layout = getattr(value, "_layout", None)
+    if layout is None:
+        return True
+    for entry in layout.alias_tensor_map:
+        axes = entry if isinstance(entry, tuple) else (entry,)
+        if any(
+            axis != "None" and layout.mesh.get_device_num_along_axis(axis) > 1
+            for axis in axes
+        ):
+            return False
+    return True
 
 
 class JTDeepseekV3RMSNorm(DeepseekV32RMSNorm):
@@ -77,12 +93,17 @@ class ReferenceSwiGLU(torch.autograd.Function):
             inputs: Inputs retained for the custom derivative.
             rounded_up_gradient: Whether to round SiLU before the up-projection gradient.
         """
-        ctx.save_for_backward(inputs)
+        local_inputs = (
+            inputs.to_local()
+            if hasattr(inputs, "to_local") and _is_effectively_replicated(inputs)
+            else inputs
+        )
+        ctx.save_for_backward(local_inputs)
         ctx.rounded_up_gradient = rounded_up_gradient
-        if inputs.device.type == "npu":
-            return torch_npu.npu_swiglu(inputs, dim=-1)
-        gate, up = inputs.float().chunk(2, dim=-1)
-        return (F.silu(gate) * up).to(inputs.dtype)
+        if local_inputs.device.type == "npu":
+            return torch_npu.npu_swiglu(local_inputs, dim=-1)
+        gate, up = local_inputs.float().chunk(2, dim=-1)
+        return (F.silu(gate) * up).to(local_inputs.dtype)
 
     @staticmethod
     def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, None]:
@@ -120,6 +141,36 @@ class JTDeepseekV3MLP(DeepseekV32MLP):
         Args:
             x: X.
         """
+        if hasattr(x, "to_local") and _is_effectively_replicated(x):
+            # Pure DP activations and parameters are complete on every rank.
+            # Keep the whole SwiGLU subgraph local so the custom autograd
+            # boundary returns ordinary gradients for the gate/up leaves.
+            local_x = x.to_local()
+            gate_weight = (
+                self.gate_proj.weight.to_local()
+                if hasattr(self.gate_proj.weight, "to_local")
+                else self.gate_proj.weight
+            )
+            up_weight = (
+                self.up_proj.weight.to_local()
+                if hasattr(self.up_proj.weight, "to_local")
+                else self.up_proj.weight
+            )
+            down_weight = (
+                self.down_proj.weight.to_local()
+                if hasattr(self.down_proj.weight, "to_local")
+                else self.down_proj.weight
+            )
+            weight = torch.stack((gate_weight, up_weight), dim=1).flatten(0, 1)
+            pair = F.linear(local_x, weight).reshape(*local_x.shape[:-1], -1, 2)
+            values = torch.cat((pair[..., 0], pair[..., 1]), dim=-1)
+            result = F.linear(
+                ReferenceSwiGLU.apply(values, self.rounded_up_gradient),
+                down_weight,
+                self.down_proj.bias.to_local() if hasattr(self.down_proj.bias, "to_local") else self.down_proj.bias,
+            )
+            return DTensor.from_local_with_layout(result, x.layout)
+
         weight = torch.stack((self.gate_proj.weight, self.up_proj.weight), dim=1).flatten(0, 1)
         pair = F.linear(x, weight).reshape(*x.shape[:-1], -1, 2)
         values = torch.cat((pair[..., 0], pair[..., 1]), dim=-1)
@@ -151,10 +202,16 @@ class ExplicitFP32RotaryEmbedding(nn.Module):
             cos: Cosine position frequencies.
             sin: Sine position frequencies.
         """
-        ordered = torch.cat((values[..., ::2], values[..., 1::2]), dim=-1).float()
+        # The even/odd channel split is a local permutation.  Materialize a
+        # replicated DP activation locally so the generic DTensor getitem
+        # contract can continue rejecting strided slices on distributed axes.
+        values_dtensor = hasattr(values, "to_local")
+        local_values = values.to_local() if values_dtensor else values
+        ordered = torch.cat((local_values[..., ::2], local_values[..., 1::2]), dim=-1).float()
         first, second = ordered.chunk(2, dim=-1)
         rotated = torch.cat((-second, first), dim=-1)
-        return (ordered * cos.unsqueeze(1) + rotated * sin.unsqueeze(1)).to(values.dtype)
+        result = (ordered * cos.unsqueeze(1) + rotated * sin.unsqueeze(1)).to(local_values.dtype)
+        return DTensor.from_local_with_layout(result, values.layout) if values_dtensor else result
 
 
 def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
@@ -189,7 +246,11 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
         keep_prob=1.0 - dropout, inner_precise=0, sparse_mode=sparse_mode,
         actual_seq_qlen=query_lengths, actual_seq_kvlen=key_lengths)
     with torch.no_grad():
-        maximum = result[1].amax(dim=(0, 2))
+        # The auxiliary max-logit output is a local observation used only for
+        # clipping diagnostics.  FSDP may wrap it as a DTensor in pure-DP
+        # mode, where no distributed reduction is needed for this metric.
+        max_logits = result[1].to_local() if hasattr(result[1], "to_local") else result[1]
+        maximum = max_logits.amax(dim=(0, 2))
         if module.max_logits_val is None:
             module.max_logits_val = torch.zeros_like(maximum)
         module.max_logits_val.copy_(torch.maximum(module.max_logits_val, maximum))
@@ -445,11 +506,17 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         group, world, padding = self.ep_group, self.ep_world, self.padding
         config = self.config
         hidden = hidden[:, padding:]
+        if group is None and hasattr(hidden, "to_local"):
+            hidden = hidden.to_local()
         with torch.autocast(hidden.device.type, enabled=False):
-            logits = F.linear(hidden.reshape(-1, hidden.shape[-1]).float(), self.gate.weight)
+            gate_weight = self.gate.weight.to_local() if hasattr(self.gate.weight, "to_local") else self.gate.weight
+            correction_bias = self.gate.e_score_correction_bias
+            if hasattr(correction_bias, "to_local"):
+                correction_bias = correction_bias.to_local()
+            logits = F.linear(hidden.reshape(-1, hidden.shape[-1]).float(), gate_weight)
             scores = logits.sigmoid()
-            selection = scores + self.gate.e_score_correction_bias
-            indices = selection.topk(config.num_experts_per_tok, dim=-1).indices
+            selection = scores + correction_bias
+            _, indices = selection.topk(config.num_experts_per_tok, dim=-1)
             frequency = torch.bincount(indices.flatten(), minlength=config.n_routed_experts).float()
             frequency = frequency / indices.numel()
             if group is not None:
@@ -464,7 +531,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             pad_ids = torch.arange(padding * config.num_experts_per_tok, device=indices.device)
             pad_ids = pad_ids.reshape(padding, config.num_experts_per_tok) % padding
             indices = torch.cat((pad_ids, indices))
-            selected = torch.cat((selected.new_zeros(padding, selected.shape[-1]), selected))
+            selected = torch.cat((selected.new_zeros((padding, selected.shape[-1])), selected))
         return indices, selected
 
     def aggregate_experts(self, outputs: torch.Tensor, weights: torch.Tensor, sources: torch.Tensor,
@@ -493,12 +560,18 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         """
         indices, probabilities = self.route(hidden)
         flat = hidden.reshape(-1, hidden.shape[-1]).to(torch.bfloat16)
-        outputs = flat.new_zeros(indices.shape[0], indices.shape[1], flat.shape[-1])
+        outputs = flat.new_zeros((indices.shape[0], indices.shape[1], flat.shape[-1]))
         for expert in range(self.experts.num_experts):
             tokens, slots = torch.where(indices == expert)
-            pair = F.linear(flat[tokens], self.experts.gate_up_proj[expert].to(flat.dtype))
+            gate_up = self.experts.gate_up_proj[expert]
+            down = self.experts.down_proj[expert]
+            if hasattr(gate_up, "to_local"):
+                gate_up = gate_up.to_local()
+            if hasattr(down, "to_local"):
+                down = down.to_local()
+            pair = F.linear(flat[tokens], gate_up.to(flat.dtype))
             values = ReferenceSwiGLU.apply(pair, False)
-            values = F.linear(values, self.experts.down_proj[expert].to(flat.dtype))
+            values = F.linear(values, down.to(flat.dtype))
             outputs = outputs.index_put((tokens, slots), values)
         return ExpertCombine.apply(outputs, probabilities, self.reference_is_mtp).reshape(hidden.shape).float()
 
@@ -520,9 +593,23 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         Args:
             hidden_states: Input hidden states.
         """
+        # Pure DP has no EP executor.  Run router/expert bookkeeping on local
+        # tensors, then restore the activation layout at the module boundary;
+        # this keeps non-distributed indexing/counting operations out of the
+        # DTensor dispatcher while preserving FSDP gradient flow.
+        if self.ep_group is None and hasattr(hidden_states, "to_local"):
+            hidden = hidden_states.to_local().float()
+            if self.padding:
+                hidden = torch.cat((hidden.new_zeros((1, self.padding, hidden.shape[-1])), hidden), dim=1)
+            routed = self.ep_compute(hidden)
+            shared = self.shared_experts(hidden_states)
+            shared = shared.to_local() if hasattr(shared, "to_local") else shared
+            result = routed[:, self.padding:] + shared.float()
+            return DTensor.from_local_with_layout(result, hidden_states.layout)
+
         hidden = hidden_states.float()
         if self.padding:
-            hidden = torch.cat((hidden.new_zeros(1, self.padding, hidden.shape[-1]), hidden), dim=1)
+            hidden = torch.cat((hidden.new_zeros((1, self.padding, hidden.shape[-1])), hidden), dim=1)
         routed = self.ep_compute(hidden)
         return routed[:, self.padding:] + self.shared_experts(hidden_states).float()
 
