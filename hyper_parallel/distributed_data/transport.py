@@ -205,15 +205,13 @@ def synchronize_build_preflight(
         direct_dataset_size: int | None,
         metadata_mode: bool,
         dataset_already_sharded: bool,
-        local_error: str | None,
         communication_backend: str = "hccl",
         communication_device: Any = None,
 ) -> None:
     """Validate rank-local build inputs on WORLD before creating subgroups.
 
     Args:
-        build_fingerprint: Stable topology and configuration identity, or
-            ``None`` when local validation failed.
+        build_fingerprint: Stable topology and configuration identity.
         is_reader: Whether this WORLD rank is configured as a Dataset Reader.
         reader_size: Dataset length in online mode or metadata length in
             metadata mode on Dataset Reader ranks.
@@ -224,12 +222,10 @@ def synchronize_build_preflight(
             is not resolved or exchanged during preflight.
         dataset_already_sharded: Whether each Dataset Reader owns an independent
             local sample and metadata stream.
-        local_error: Formatted local validation error, if any.
 
     Raises:
-        ValueError: If any rank failed validation, build inputs differ, or
-            Dataset Readers and direct readers do not expose one consistent
-            logical index space.
+        ValueError: If build inputs differ or Dataset Readers and direct readers
+            do not expose one consistent logical index space.
     """
     distributed = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if distributed else 0
@@ -245,11 +241,8 @@ def synchronize_build_preflight(
         is_direct_reader,
         direct_dataset_size,
         dataset_already_sharded,
-        local_error,
     )
     if not distributed:
-        if local_error is not None:
-            raise ValueError(f"Distributed DataLoader build preflight failed on rank {rank}: {local_error}")
         return
 
     startup_group = None
@@ -261,7 +254,7 @@ def synchronize_build_preflight(
         device=communication_device,
         backend=communication_backend,
     ))
-    _validate_build_errors_and_fingerprint(gathered)
+    _validate_build_fingerprint(gathered)
     _validate_build_sharding_modes(gathered)
     dataset_reader_sizes = [(item[0], item[3]) for item in gathered if item[2]]
     _validate_dataset_reader_sizes(
@@ -279,12 +272,8 @@ def synchronize_build_preflight(
     )
 
 
-def _validate_build_errors_and_fingerprint(normalized: Sequence[tuple[Any, ...]]) -> None:
-    errors = [(item[0], item[7]) for item in normalized if item[7] is not None]
-    if errors:
-        error_rank, error = min(errors)
-        raise ValueError(f"Distributed DataLoader build preflight failed on rank {error_rank}: {error}")
-
+def _validate_build_fingerprint(normalized: Sequence[tuple[Any, ...]]) -> None:
+    """Reject rank-inconsistent build identities without synchronizing errors."""
     fingerprints = {item[1] for item in normalized}
     if len(fingerprints) != 1 or None in fingerprints:
         details = ", ".join(f"rank {item[0]}={item[1]!r}" for item in normalized)

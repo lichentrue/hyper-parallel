@@ -144,7 +144,7 @@ class TestDistributedDataPublicApi(unittest.TestCase):
 
 
 class TestDistributedDataBuildState(unittest.TestCase):
-    """Keep mode-specific construction and partial-failure preflight intact."""
+    """Keep mode-specific construction and direct validation failures explicit."""
 
     @staticmethod
     def _mesh() -> SimpleNamespace:
@@ -177,23 +177,21 @@ class TestDistributedDataBuildState(unittest.TestCase):
                 self.assertEqual(status["is_direct_reader"], metadata_mode)
                 self.assertEqual(status["direct_dataset_size"], len(samples) if metadata_mode else None)
                 self.assertFalse(status["dataset_already_sharded"])
-                self.assertIsNone(status["local_error"])
 
-    def test_invalid_config_reaches_preflight_before_group_creation(self) -> None:
-        """Reading sharding policy must not mask an invalid-config build error."""
+    def test_invalid_config_raises_before_preflight_or_group_creation(self) -> None:
+        """Invalid configuration errors are raised directly at the build site."""
         for config in (None, {}, object()):
             with self.subTest(config=config), patch(
                     "hyper_parallel.distributed_data.api.synchronize_build_preflight",
                     wraps=synchronize_build_preflight,
             ) as preflight, patch("hyper_parallel.distributed_data.api.create_data_groups") as create_groups:
-                with self.assertRaisesRegex(ValueError, "build preflight.*config must be DistributedDatasetConfig"):
+                with self.assertRaisesRegex(ValueError, "config must be DistributedDatasetConfig"):
                     build_distributed_dataloader([], self._mesh(), config)
-                preflight.assert_called_once()
-                self.assertFalse(preflight.call_args.kwargs["dataset_already_sharded"])
+                preflight.assert_not_called()
                 create_groups.assert_not_called()
 
-    def test_partial_build_failures_reach_preflight_before_group_creation(self) -> None:
-        """Option errors and metadata size mismatches must retain synchronized failure."""
+    def test_partial_build_failures_raise_before_preflight_or_group_creation(self) -> None:
+        """Local option and metadata errors are raised without error synchronization."""
         cases = (
             ({"dataloader_kwargs": {"num_workers": -1}, "metadata_fn": lambda _: SampleMetadata(1)},
              "num_workers", False),
@@ -211,16 +209,9 @@ class TestDistributedDataBuildState(unittest.TestCase):
                         "hyper_parallel.distributed_data.api.synchronize_build_preflight",
                         wraps=synchronize_build_preflight,
                 ) as preflight, patch("hyper_parallel.distributed_data.api.create_data_groups") as create_groups:
-                    with self.assertRaisesRegex(ValueError, "build preflight.*" + message):
+                    with self.assertRaisesRegex(ValueError, message):
                         build_distributed_dataloader([0, 1], self._mesh(), config, **kwargs)
-                    preflight.assert_called_once()
-                    status = preflight.call_args.kwargs
-                    self.assertEqual(status["dataset_already_sharded"], sharded)
-                    self.assertRegex(status["local_error"], message)
-                    if "metadata" in kwargs:
-                        self.assertTrue(status["is_direct_reader"])
-                        self.assertIsNone(status["reader_size"])
-                        self.assertIsNone(status["direct_dataset_size"])
+                    preflight.assert_not_called()
                     create_groups.assert_not_called()
 
     def test_metadata_mode_requires_the_configured_metadata_source(self) -> None:
@@ -253,7 +244,7 @@ class TestDistributedDataBuildState(unittest.TestCase):
                 sampler = build_dataset_batch_sampler(
                     total_samples=2, micro_batch_size=1, global_batch_size=1, dp_world_size=1, dp_rank=0,
                 )
-                with self.assertRaisesRegex(ValueError, "build preflight.*" + message):
+                with self.assertRaisesRegex(ValueError, message):
                     build_distributed_dataloader(
                         [0, 1], self._mesh(), config, batch_sampler=sampler, **callbacks,
                         device="cpu", cost_model=lambda sample_metadata: sample_metadata.cost,

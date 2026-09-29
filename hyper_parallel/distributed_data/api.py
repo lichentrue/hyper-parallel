@@ -416,7 +416,6 @@ class _BuildState:
     communication_device: torch.device | None = None
     reader_size: int | None = None
     direct_dataset_size: int | None = None
-    local_error: str | None = None
 
     @property
     def is_reader(self) -> bool:
@@ -665,7 +664,8 @@ def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfi
     build_fingerprint = None
     if state.topology is not None and state.config_fingerprint is not None:
         build_fingerprint = _build_fingerprint(state.topology, state.config_fingerprint)
-    # Invalid configs must still participate in WORLD build preflight synchronization.
+    # Only successfully built local state enters WORLD preflight; local errors
+    # are raised directly by the caller.
     dataset_already_sharded = isinstance(config, DistributedDatasetConfig) and config.dataset_already_sharded
     metadata_mode = getattr(config, "metadata_mode", False)
     is_direct_reader = metadata_mode and state.topology is not None and state.topology.is_constructor
@@ -677,7 +677,6 @@ def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfi
         direct_dataset_size=state.direct_dataset_size,
         metadata_mode=metadata_mode,
         dataset_already_sharded=dataset_already_sharded,
-        local_error=state.local_error,
         communication_backend=getattr(config, "communication_backend", "hccl"),
         communication_device=state.communication_device,
     )
@@ -888,31 +887,27 @@ def _build_distributed_dataloader_impl(
     if communication_device is None:
         communication_device = _resolve_device(communication_backend=getattr(config, "communication_backend", "hccl"))
     state = _BuildState()
-    device_prefetch = None
-    try:
-        if getattr(config, "balance_group_size", None) is not None:
-            raise ValueError("balance_group_size is only supported for local balancing paths.")
-        _populate_build_state(
-            state,
-            dataset,
-            mesh,
-            config,
-            metadata_fn,
-            metadata,
-            dataloader_kwargs,
-            pack_fn,
-            collate_fn,
-            communication_device,
-            batch_sampler,
-            model_config=model_config,
-            cost_model=cost_model,
-            balancing_algorithm=balancing_algorithm,
-        )
-        device = _resolve_device(communication_device)
-        device_prefetch = _create_device_prefetcher(device, move_fn)
-        state.communication_device = device
-    except Exception as exc:  # Every WORLD rank must fail before subgroup creation.
-        state.local_error = f"{type(exc).__name__}: {exc}"
+    if getattr(config, "balance_group_size", None) is not None:
+        raise ValueError("balance_group_size is only supported for local balancing paths.")
+    _populate_build_state(
+        state,
+        dataset,
+        mesh,
+        config,
+        metadata_fn,
+        metadata,
+        dataloader_kwargs,
+        pack_fn,
+        collate_fn,
+        communication_device,
+        batch_sampler,
+        model_config=model_config,
+        cost_model=cost_model,
+        balancing_algorithm=balancing_algorithm,
+    )
+    device = _resolve_device(communication_device)
+    device_prefetch = _create_device_prefetcher(device, move_fn)
+    state.communication_device = device
 
     _synchronize_build_state(state, config)
     _require_build_state(state)

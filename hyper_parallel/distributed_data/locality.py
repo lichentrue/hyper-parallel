@@ -83,11 +83,8 @@ def _validate_startup_statuses(
         statuses: list[Any],
         identity: Any,
 ) -> None:
-    """Check the gathered startup results before creating node groups."""
-    for entry in statuses:
-        if entry[1] is not None:
-            raise ValueError(f"Local balancing build failed on rank {entry[0]}: {entry[1]}")
-    if any(entry[2] != identity for entry in statuses):
+    """Check gathered topology identities before creating node groups."""
+    if any(entry[1] != identity for entry in statuses):
         raise ValueError("Local balancing configuration or root mesh differs across WORLD ranks.")
 
 
@@ -123,7 +120,6 @@ def _create_locality_groups(
         dp_dim_names: tuple[str, ...] | None = None,
         balance_group_size: int | None = None,
         build_identity: Any = None,
-        local_error: str | None = None,
         communication_backend: str = "hccl",
         communication_device: Any = None,
 ) -> tuple[DataTopology, DataGroups]:
@@ -134,7 +130,6 @@ def _create_locality_groups(
         dp_dim_names: Root mesh data-parallel dimensions.
         balance_group_size: Optional fixed number of ranks per balancing group.
         build_identity: Rank-independent caller configuration checked during startup.
-        local_error: Caller preflight error, synchronized before subgroup creation.
 
     Returns:
         Training topology and this rank's independent data exchange groups.
@@ -147,20 +142,12 @@ def _create_locality_groups(
     _validate_communication_config(communication_backend, communication_device, distributed)
     rank = dist.get_rank() if distributed else 0
     world_size = dist.get_world_size() if distributed else 1
-    topology = None
-    identity = None
-    selected_node = None
-    try:
-        if local_error is not None:
-            raise ValueError(local_error)
-        topology = _resolve_local_topology(mesh, rank, world_size, dp_dim_names)
-        if balance_group_size is not None:
-            _fixed_rank_groups(topology, balance_group_size)
-        selected_node = os.environ.get("GROUP_RANK") or socket.gethostname()
-        identity = (topology.fingerprint, build_identity)
-    except Exception as exc:
-        local_error = f"{type(exc).__name__}: {exc}"
-    status = (rank, local_error, identity, selected_node)
+    topology = _resolve_local_topology(mesh, rank, world_size, dp_dim_names)
+    if balance_group_size is not None:
+        _fixed_rank_groups(topology, balance_group_size)
+    selected_node = os.environ.get("GROUP_RANK") or socket.gethostname()
+    identity = (topology.fingerprint, build_identity)
+    status = (rank, identity, selected_node)
     statuses = _gather_startup_statuses(
         status,
         distributed=distributed,
@@ -169,7 +156,7 @@ def _create_locality_groups(
     )
     _validate_startup_statuses(statuses, identity)
     if balance_group_size is None:
-        rank_groups = _node_rank_groups(topology, {entry[0]: entry[3] for entry in statuses})
+        rank_groups = _node_rank_groups(topology, {entry[0]: entry[2] for entry in statuses})
     else:
         rank_groups = _fixed_rank_groups(topology, balance_group_size)
     own_groups = None
