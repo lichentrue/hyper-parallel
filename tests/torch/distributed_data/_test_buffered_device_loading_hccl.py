@@ -58,7 +58,9 @@ def _native(device: torch.device, backend: str, metadata_mode: bool) -> None:
         "metadata_fn": _metadata,
     }
     with build_distributed_dataloader(
-            dataset, mesh, DistributedDatasetConfig(seq_len=8, local_batch_size=2, communication_backend=backend),
+            dataset, mesh, DistributedDatasetConfig(
+                seq_len=8, local_batch_size=2, communication_backend=backend, metadata_mode=metadata_mode,
+            ),
             batch_sampler=sampler, device=device, move_fn=_move,
             cost_model=lambda metadata: metadata.cost, **options,
     ) as loader:

@@ -219,7 +219,9 @@ def synchronize_build_preflight(
             metadata mode on Dataset Reader ranks.
         is_direct_reader: Whether this rank reads samples selected from metadata.
         direct_dataset_size: Mapping-Dataset length on plan-aware reader ranks.
-        metadata_mode: Whether metadata is available before sample reads.
+        metadata_mode: Rank-local choice of whether metadata is available before
+            sample reads. The caller's config controls this directly; the mode
+            is not resolved or exchanged during preflight.
         dataset_already_sharded: Whether each Dataset Reader owns an independent
             local sample and metadata stream.
         local_error: Formatted local validation error, if any.
@@ -231,6 +233,10 @@ def synchronize_build_preflight(
     """
     distributed = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if distributed else 0
+    # ``metadata_mode`` is a rank-local configuration input.  It is used below
+    # to validate the local reader/index spaces, while the complete build
+    # fingerprint still catches a mismatched DistributedDatasetConfig across
+    # ranks.  Do not exchange the mode as a separate preflight decision.
     status = (
         rank,
         build_fingerprint,
@@ -238,7 +244,6 @@ def synchronize_build_preflight(
         reader_size,
         is_direct_reader,
         direct_dataset_size,
-        metadata_mode,
         dataset_already_sharded,
         local_error,
     )
@@ -257,7 +262,7 @@ def synchronize_build_preflight(
         backend=communication_backend,
     ))
     _validate_build_errors_and_fingerprint(gathered)
-    _validate_build_modes(gathered)
+    _validate_build_sharding_modes(gathered)
     dataset_reader_sizes = [(item[0], item[3]) for item in gathered if item[2]]
     _validate_dataset_reader_sizes(
         dataset_reader_sizes,
@@ -275,7 +280,7 @@ def synchronize_build_preflight(
 
 
 def _validate_build_errors_and_fingerprint(normalized: Sequence[tuple[Any, ...]]) -> None:
-    errors = [(item[0], item[8]) for item in normalized if item[8] is not None]
+    errors = [(item[0], item[7]) for item in normalized if item[7] is not None]
     if errors:
         error_rank, error = min(errors)
         raise ValueError(f"Distributed DataLoader build preflight failed on rank {error_rank}: {error}")
@@ -286,11 +291,9 @@ def _validate_build_errors_and_fingerprint(normalized: Sequence[tuple[Any, ...]]
         raise ValueError(f"Distributed DataLoader build configuration mismatch across WORLD ranks: {details}.")
 
 
-def _validate_build_modes(normalized: Sequence[tuple[Any, ...]]) -> None:
-    modes = {item[6] for item in normalized}
-    if len(modes) != 1:
-        raise ValueError("Distributed DataLoader metadata mode differs across WORLD ranks.")
-    sharding_modes = {item[7] for item in normalized}
+def _validate_build_sharding_modes(normalized: Sequence[tuple[Any, ...]]) -> None:
+    """Reject incompatible Dataset Reader sharding settings across ranks."""
+    sharding_modes = {item[6] for item in normalized}
     if len(sharding_modes) != 1:
         raise ValueError("Distributed DataLoader Dataset sharding mode differs across WORLD ranks.")
 

@@ -213,9 +213,12 @@ def _build_native_sampler_loader(
     communication_device = torch.device("cpu")
     if device_type != "cpu":
         communication_device = torch.device(device_type, getattr(torch, device_type).current_device())
+    effective_metadata_fn = metadata_fn
+    if not config.metadata_mode and effective_metadata_fn is None:
+        effective_metadata_fn = _native_text_metadata
     return build_distributed_dataloader(
         dataset, mesh_context.device_mesh, config,
-        batch_sampler=batch_sampler, metadata_fn=metadata_fn if metadata_fn is not None else _native_text_metadata,
+        batch_sampler=batch_sampler, metadata_fn=effective_metadata_fn,
         collate_fn=collate_fn, dataloader_kwargs=worker_kwargs,
         device=communication_device,
         model_config=model_config,
@@ -256,8 +259,10 @@ def build_dataloader(
         data_config: Dataset options, including the Indexed packing stage.
         max_seq_len: Maximum sample length used to derive dynamic token budget.
         default_seed: Seed used when no training seed is configured.
-        metadata_fn: Native physical sample metadata for ``load_balance=native_batch_sampler``.
-            Defaults to complete GPT output lengths; VLMTrainer supplies image metadata.
+        metadata_fn: Native physical sample metadata for online
+            ``load_balance=native_batch_sampler``. Defaults to complete GPT output
+            lengths; VLMTrainer supplies image metadata. Offline mode uses the
+            indexed metadata configured on the Dataset instead.
         model_config: Effective model dimensions for the default workload estimator.
             Unsupported architectures require an explicit cost model.
         cost_model: Optional workload callback overriding the configured cost-model target.

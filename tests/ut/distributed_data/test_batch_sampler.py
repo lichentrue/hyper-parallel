@@ -73,7 +73,8 @@ def _loader(
     if not metadata_mode:
         kwargs = {"metadata_fn": _metadata}
     loader = build_distributed_dataloader(
-        dataset, _StandaloneMesh(), DistributedDatasetConfig(seq_len=16, local_batch_size=2, **options),
+        dataset, _StandaloneMesh(),
+        DistributedDatasetConfig(seq_len=16, local_batch_size=2, metadata_mode=metadata_mode, **options),
         batch_sampler=sampler if sampler is not None else _sampler(), **kwargs,
         device="cpu", cost_model=lambda metadata: metadata.cost,
     )
@@ -256,6 +257,25 @@ class TestNativeBatchSampler(unittest.TestCase):
         self.assertEqual(samplers, (None, None, None))
         self.assertIs(build.call_args.kwargs["collate_fn"], collator)
         self.assertEqual(next(iter(build.call_args.kwargs["batch_sampler"])), [3, 3])
+
+    def test_trainer_builder_forwards_offline_metadata_mode_without_callback(self) -> None:
+        """Offline configuration must let the Dataset provide indexed metadata."""
+        context = SimpleNamespace(dp_rank=0, dp_size=1, device_mesh=_StandaloneMesh(), pp_size=1)
+        target = SimpleNamespace(dataloader_type="single")
+        data_config = {
+            "seq_length": 16,
+            "load_balance": "native_batch_sampler",
+            "distributed_dataloader": {"metadata_mode": True},
+        }
+        with patch("hyper_parallel.data.batching.build_dataloader.build_distributed_dataloader") as build:
+            build_dataloader(
+                target, datasets=(_TrackedDataset(), None, None), collate_fn=tuple,
+                mesh_context=context,
+                training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=4, seed=7),
+                data_config=data_config,
+            )
+        self.assertTrue(build.call_args.args[2].metadata_mode)
+        self.assertIsNone(build.call_args.kwargs["metadata_fn"])
 
     def test_trainer_rejects_conflicting_selection_modes(self) -> None:
         """The new opt-in must not silently replace an independent packing/selection stage."""

@@ -71,7 +71,9 @@ def _run_case(
     dataset = _Dataset()
     reference = list(_sampler(sampler_type, data_sharding))
     source_sampler = _sampler(sampler_type, data_sharding)
-    config = DistributedDatasetConfig(seq_len=8, local_batch_size=2, communication_backend="gloo")
+    config = DistributedDatasetConfig(
+        seq_len=8, local_batch_size=2, communication_backend="gloo", metadata_mode=metadata_mode,
+    )
     metadata_options = (
         {"metadata": [_metadata({"id": index}) for index in range(len(dataset))]}
         if metadata_mode else {"metadata_fn": _metadata}

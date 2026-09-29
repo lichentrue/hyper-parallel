@@ -49,10 +49,12 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         self.assertNotIn("micro_batch_num", field_names)
         self.assertNotIn("buffer_size_multiplier", field_names)
         self.assertNotIn("shuffle", field_names)
+        self.assertIn("metadata_mode", field_names)
 
         config = DistributedDatasetConfig(seq_len=32_768, local_batch_size=4)
         self.assertFalse(hasattr(config, "enable_dp_balance"))
         self.assertFalse(config.dataset_already_sharded)
+        self.assertFalse(config.metadata_mode)
         self.assertFalse(hasattr(config, "raw_sample_size"))
         self.assertFalse(hasattr(config, "micro_batch_num"))
         self.assertFalse(hasattr(config, "buffer_size_multiplier"))
@@ -115,6 +117,15 @@ class TestDistributedDataPublicApi(unittest.TestCase):
             DistributedDatasetConfig(seq_len=32, local_batch_size=1, dataset_already_sharded=1)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_metadata_mode_must_be_boolean(self) -> None:
+        """Feature: Explicit metadata source selection.
+        Description: Configure metadata mode with a truthy non-boolean value.
+        Expectation: Configuration validation rejects the invalid value.
+        """
+        with self.assertRaisesRegex(ValueError, "metadata_mode must be boolean"):
+            DistributedDatasetConfig(seq_len=32, local_batch_size=1, metadata_mode=1)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_balance_group_size_is_positive_and_topology_divisible(self) -> None:
         """Feature: Local balancing groups.
         Description: Configure fixed-size groups over the root mesh rank order.
@@ -145,7 +156,7 @@ class TestDistributedDataBuildState(unittest.TestCase):
         samples = [0, 1]
         metadata = [SampleMetadata(pack_tokens=4, sample_id=index) for index in samples]
         for metadata_mode in (False, True):
-            config = DistributedDatasetConfig(seq_len=8, local_batch_size=1)
+            config = DistributedDatasetConfig(seq_len=8, local_batch_size=1, metadata_mode=metadata_mode)
             callbacks = {"metadata": metadata} if metadata_mode else {"metadata_fn": metadata.__getitem__}
             with self.subTest(metadata_mode=metadata_mode), patch(
                     "hyper_parallel.distributed_data.api.synchronize_build_preflight",
@@ -184,13 +195,18 @@ class TestDistributedDataBuildState(unittest.TestCase):
     def test_partial_build_failures_reach_preflight_before_group_creation(self) -> None:
         """Option errors and metadata size mismatches must retain synchronized failure."""
         cases = (
-            ({"dataloader_kwargs": {"num_workers": -1}}, "num_workers"),
-            ({"device": "invalid-device"}, "communication_device"),
-            ({"metadata": [SampleMetadata(pack_tokens=1)]}, "Metadata mode requires batch_sampler"),
+            ({"dataloader_kwargs": {"num_workers": -1}, "metadata_fn": lambda _: SampleMetadata(1)},
+             "num_workers", False),
+            ({"device": "invalid-device", "metadata_fn": lambda _: SampleMetadata(1)},
+             "communication_device", False),
+            ({"metadata": [SampleMetadata(pack_tokens=1)]}, "Metadata mode requires batch_sampler", True),
         )
         for sharded in (False, True):
-            config = DistributedDatasetConfig(seq_len=8, local_batch_size=1, dataset_already_sharded=sharded)
-            for kwargs, message in cases:
+            for kwargs, message, metadata_mode in cases:
+                config = DistributedDatasetConfig(
+                    seq_len=8, local_batch_size=1, dataset_already_sharded=sharded,
+                    metadata_mode=metadata_mode,
+                )
                 with self.subTest(sharded=sharded, message=message), patch(
                         "hyper_parallel.distributed_data.api.synchronize_build_preflight",
                         wraps=synchronize_build_preflight,
@@ -206,6 +222,42 @@ class TestDistributedDataBuildState(unittest.TestCase):
                         self.assertIsNone(status["reader_size"])
                         self.assertIsNone(status["direct_dataset_size"])
                     create_groups.assert_not_called()
+
+    def test_metadata_mode_requires_the_configured_metadata_source(self) -> None:
+        """Metadata source arguments must agree with the explicit config mode."""
+        metadata = [SampleMetadata(pack_tokens=1), SampleMetadata(pack_tokens=1)]
+        cases = (
+            (
+                DistributedDatasetConfig(seq_len=8, local_batch_size=1, metadata_mode=True),
+                {"metadata_fn": lambda _: metadata[0]},
+                "metadata_mode=True requires precomputed metadata",
+            ),
+            (
+                DistributedDatasetConfig(seq_len=8, local_batch_size=1, metadata_mode=True),
+                {},
+                "metadata_mode=True requires metadata",
+            ),
+            (
+                DistributedDatasetConfig(seq_len=8, local_batch_size=1),
+                {"metadata": metadata},
+                "metadata_mode=False requires metadata_fn",
+            ),
+            (
+                DistributedDatasetConfig(seq_len=8, local_batch_size=1),
+                {},
+                "metadata_mode=False requires metadata_fn",
+            ),
+        )
+        for config, callbacks, message in cases:
+            with self.subTest(metadata_mode=config.metadata_mode, message=message):
+                sampler = build_dataset_batch_sampler(
+                    total_samples=2, micro_batch_size=1, global_batch_size=1, dp_world_size=1, dp_rank=0,
+                )
+                with self.assertRaisesRegex(ValueError, "build preflight.*" + message):
+                    build_distributed_dataloader(
+                        [0, 1], self._mesh(), config, batch_sampler=sampler, **callbacks,
+                        device="cpu", cost_model=lambda sample_metadata: sample_metadata.cost,
+                    )
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_native_sampler_rejects_local_balance_groups(self) -> None:

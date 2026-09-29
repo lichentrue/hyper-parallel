@@ -53,7 +53,6 @@ from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.distributed_data.transport import (
     DataPlaneTransport,
     ModelParallelTransport,
-    all_gather_control_object,
     create_data_groups,
     synchronize_build_preflight,
 )
@@ -131,6 +130,9 @@ class DistributedDatasetConfig:
             is the default for NPU training and serializes control objects into
             accelerator tensors. ``gloo`` keeps control and CPU payload
             communication on Gloo. HCCL requires an NPU communication device.
+        metadata_mode: Whether metadata is precomputed and available by Dataset
+            index. ``False`` means the Dataset Reader loads samples and calls
+            ``metadata_fn`` during native sampler planning.
     """
 
     seq_len: int
@@ -150,6 +152,7 @@ class DistributedDatasetConfig:
     packing_budgets: dict[str, float] | None = None
     communication_backend: Literal["gloo", "hccl"] = "hccl"
     balance_group_size: int | None = None
+    metadata_mode: bool = False
 
     def __post_init__(self) -> None:
         """Validate topology-independent configuration boundaries."""
@@ -184,6 +187,7 @@ class DistributedDatasetConfig:
         for name in (
                 "dataset_already_sharded",
                 "drop_last",
+                "metadata_mode",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be boolean.")
@@ -363,6 +367,9 @@ def _config_fingerprint(
         stable_config.pop("packing_budgets")
     else:
         stable_config["packing_budgets"] = tuple(sorted(config.packing_budgets.items()))
+    # ``sidecar_mode`` is the established serialized key for the metadata
+    # source choice. Do not add the new public field to checkpoint identities.
+    stable_config.pop("metadata_mode", None)
     for name in _CONFIG_DATALOADER_KWARGS:
         stable_config.pop(name)
     # Preserve fingerprints of checkpoints made with the old default config.
@@ -391,32 +398,6 @@ def _normalize_communication_device(communication_device: Any) -> torch.device |
 def _build_fingerprint(topology: DataTopology, config_fingerprint: str) -> str:
     identity = (topology.fingerprint, config_fingerprint)
     return hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()[:24]
-
-
-def _resolve_metadata_mode(
-        metadata_fn: Callable[[Any], SampleMetadata] | None,
-        metadata: Sequence[SampleMetadata] | None,
-        communication_backend: str = "hccl",
-        communication_device: Any = None,
-) -> bool:
-    """Resolve metadata availability before creating data-plane subgroups."""
-    local_flags = (metadata_fn is not None, metadata is not None)
-    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
-    if distributed:
-        startup_group = None
-        if communication_backend == "gloo":
-            startup_group = torch.distributed.new_group(
-                ranks=list(range(torch.distributed.get_world_size())), backend="gloo"
-            )
-        gathered = all_gather_control_object(
-            local_flags,
-            group=startup_group,
-            device=communication_device,
-            backend=communication_backend,
-        )
-        metadata_fn_present = any(item[0] for item in gathered)
-        return not metadata_fn_present
-    return metadata_fn is None or local_flags[1]
 
 
 @dataclass
@@ -627,7 +608,8 @@ def _populate_build_state(
 ) -> None:
     if not isinstance(config, DistributedDatasetConfig):
         raise ValueError(f"config must be DistributedDatasetConfig, but got {type(config)}.")
-    metadata = _infer_dataset_metadata(dataset, metadata_fn, metadata)
+    if batch_sampler is not None and config.metadata_mode:
+        metadata = _infer_dataset_metadata(dataset, metadata_fn, metadata)
     _validate_builder_callbacks(metadata_fn, metadata, pack_fn, collate_fn)
     normalized_options, dataloader_fingerprint = _normalize_dataloader_kwargs(
         config,
@@ -649,6 +631,15 @@ def _populate_build_state(
         if state.metadata_mode:
             raise ValueError("Metadata mode requires batch_sampler to define step/sample boundaries.")
         raise ValueError("Online mode requires batch_sampler or external_step_source to define complete steps.")
+    if config.metadata_mode:
+        if metadata_fn is not None:
+            raise ValueError("metadata_mode=True requires precomputed metadata, not metadata_fn.")
+        if metadata is None:
+            raise ValueError("metadata_mode=True requires metadata or Dataset.get_sample_metadata().")
+    elif metadata is not None:
+        raise ValueError("metadata_mode=False requires metadata_fn, not precomputed metadata.")
+    elif metadata_fn is None:
+        raise ValueError("metadata_mode=False requires metadata_fn.")
     batch_sampler_fingerprint = _configure_batch_sampler_sources(
         state, dataset, metadata_fn, metadata, config, batch_sampler, loader_options,
     )
@@ -745,11 +736,11 @@ def build_distributed_dataloader(
         metadata_fn: Derives metadata from each Dataset output in
             ``batch_sampler`` mode or each raw sample emitted by
             ``external_step_source``.
-        metadata: Precomputed metadata for BatchSampler mode on Dataset Reader ranks. Indexed
-            source Datasets that implement ``get_sample_metadata`` provide this
-            automatically when both metadata arguments are omitted. It is a
-            shared global sequence. Entry ``metadata[index]`` must
-            describe the corresponding ``dataset[index]``.
+        metadata: Precomputed metadata for BatchSampler mode on Dataset Reader ranks
+            when ``config.metadata_mode`` is true. Indexed source Datasets that
+            implement ``get_sample_metadata`` provide this automatically when both
+            metadata arguments are omitted. It is a shared global sequence. Entry
+            ``metadata[index]`` must describe the corresponding ``dataset[index]``.
         dataloader_kwargs: Optional DataLoader execution options. These
             override the worker options retained in ``config``. Sampling,
             batching, shuffling, and DataLoader collation remain internally
@@ -808,6 +799,8 @@ def build_distributed_dataloader(
         or algorithm_id attributes for build/checkpoint identity.
     """
     if isinstance(dataset, DistributedDataset):
+        if config.metadata_mode:
+            raise ValueError("metadata_mode=True requires a native batch_sampler with precomputed metadata.")
         if any(value is not None for value in (
                 metadata_fn, metadata, pack_fn, collate_fn, move_fn, bin_stats_fn,
                 batch_sampler, external_step_source,
@@ -829,6 +822,8 @@ def build_distributed_dataloader(
         )
         return DatasetDataLoader(dataset, loader, device)
     if external_step_source is not None:
+        if config.metadata_mode:
+            raise ValueError("external_step_source requires metadata_mode=False for online metadata.")
         if batch_sampler is not None or metadata is not None:
             raise ValueError("external_step_source cannot be combined with a sampler or metadata sequence.")
         if dataloader_kwargs:
@@ -885,12 +880,7 @@ def _build_distributed_dataloader_impl(
 ) -> DistributedDataLoader:
     if communication_device is None:
         communication_device = _resolve_device(communication_backend=getattr(config, "communication_backend", "hccl"))
-    metadata_mode = _resolve_metadata_mode(
-        metadata_fn,
-        metadata,
-        communication_backend=getattr(config, "communication_backend", "hccl"),
-        communication_device=communication_device,
-    )
+    metadata_mode = getattr(config, "metadata_mode", False)
     state = _BuildState(
         metadata_mode=metadata_mode, model_config=model_config,
         cost_model=cost_model, balancing_algorithm=balancing_algorithm,

@@ -37,9 +37,15 @@ checksum; duplicate received keys and missing/unexpected Constructor payloads
 still fail. All ranks in a job must run the same code version. Runtime errors
 propagate locally without error-synchronization collectives.
 
-There is no metadata-only streaming mode. Passing only `metadata` (including
-Dataset-inferred metadata) without `batch_sampler` fails at build time.
-Passing only `metadata_fn` without a sampler or external step source also fails.
+`DistributedDatasetConfig.metadata_mode` selects the metadata source explicitly.
+The default `False` is online mode: pass `metadata_fn` and let HP derive
+metadata from the samples selected by the native `batch_sampler` (or by an
+`external_step_source`). Set it to `True` for offline metadata: pass a
+precomputed `metadata` sequence, or use a Dataset that provides
+`get_sample_metadata()`. Offline mode requires a native `batch_sampler`, and
+the metadata and Dataset indices must have the same length and ordering.
+Passing `metadata` in online mode or `metadata_fn` in offline mode fails at
+build time. There is no metadata-only streaming mode.
 The loader never expands a candidate window to infer how many samples a step
 should contain; there is no refill/`attempt` loop.
 
@@ -120,7 +126,7 @@ batch_sampler = build_dataset_batch_sampler(
 loader = build_distributed_dataloader(
     dataset,
     mesh,
-    DistributedDatasetConfig(seq_len=32768, local_batch_size=2),
+    DistributedDatasetConfig(seq_len=32768, local_batch_size=2, metadata_mode=False),
     batch_sampler=batch_sampler,
     metadata_fn=lambda sample: SampleMetadata(pack_tokens=len(sample["tokens"])),
     collate_fn=native_collate_fn,
@@ -385,7 +391,7 @@ PyTorch DataLoader execution options can be passed through
 loader = build_distributed_dataloader(
     dataset,
     mesh,
-    config,
+    DistributedDatasetConfig(seq_len=32768, local_batch_size=2, metadata_mode=False),
     batch_sampler=batch_sampler,
     metadata_fn=metadata_fn,
     cost_model=my_cost_model,
@@ -428,7 +434,7 @@ native sampler:
 loader = build_distributed_dataloader(
     dataset,
     mesh,
-    config,
+    DistributedDatasetConfig(seq_len=32768, local_batch_size=2, metadata_mode=True),
     batch_sampler=batch_sampler,
     metadata=precomputed_metadata,
     collate_fn=native_collate_fn,

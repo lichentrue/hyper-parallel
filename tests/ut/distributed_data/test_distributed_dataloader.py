@@ -144,7 +144,10 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 ):
                     with build_distributed_dataloader(
                             list(range(6)), _StandaloneMesh(),
-                            DistributedDatasetConfig(seq_len=10, local_batch_size=2, communication_backend="gloo"),
+                            DistributedDatasetConfig(
+                                seq_len=10, local_batch_size=2, communication_backend="gloo",
+                                metadata_mode=metadata_mode,
+                            ),
                             batch_sampler=_sampler(), device="cuda:0", move_fn=move,
                             cost_model=lambda metadata: metadata.cost, **options,
                     ) as loader:
@@ -261,12 +264,15 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 ([], {"metadata": []}),
                 (Dataset(), {}),
         ):
+            metadata_mode = "metadata" in options or isinstance(dataset, Dataset)
             with self.subTest(dataset=type(dataset).__name__), patch(
                     "hyper_parallel.distributed_data.api.create_data_groups",
             ) as groups:
                 with self.assertRaisesRegex(ValueError, "Metadata mode requires batch_sampler"):
                     build_distributed_dataloader(
-                        dataset, _StandaloneMesh(), DistributedDatasetConfig(seq_len=10, local_batch_size=1),
+                        dataset, _StandaloneMesh(), DistributedDatasetConfig(
+                            seq_len=10, local_batch_size=1, metadata_mode=metadata_mode,
+                        ),
                         **options,
                     )
                 groups.assert_not_called()
@@ -302,7 +308,9 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 return {"id": index}
 
         loader = build_distributed_dataloader(
-            Dataset(), _StandaloneMesh(), DistributedDatasetConfig(seq_len=10, local_batch_size=2),
+            Dataset(), _StandaloneMesh(), DistributedDatasetConfig(
+                seq_len=10, local_batch_size=2, metadata_mode=True,
+            ),
             batch_sampler=_sampler(), metadata=[SampleMetadata(1)] * 6,
             device="cpu", cost_model=lambda metadata: metadata.cost,
         )
@@ -414,7 +422,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
             """Build a metadata-first sampler loader for checkpoint replay."""
             loader = build_distributed_dataloader(
                 samples, _StandaloneMesh(),
-                DistributedDatasetConfig(seq_len=10, local_batch_size=2),
+                DistributedDatasetConfig(seq_len=10, local_batch_size=2, metadata_mode=True),
                 metadata=[SampleMetadata(sample["tokens"]) for sample in samples], batch_sampler=_sampler(),
                 device="cpu", cost_model=lambda metadata: metadata.cost,
             )

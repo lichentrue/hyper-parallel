@@ -138,7 +138,7 @@ class TestDataLoaderKwargs(unittest.TestCase):
             build_distributed_dataloader(
                 samples,
                 _StandaloneMesh(),
-                self._config(),
+                self._config(metadata_mode=True),
                 metadata=metadata,
                 device="cpu", cost_model=lambda metadata: metadata.cost,
                 dataloader_kwargs=supplied,
@@ -261,6 +261,7 @@ class TestDataLoaderKwargs(unittest.TestCase):
         legacy_config["shuffle"] = False
         for name in ("num_workers", "pin_memory", "prefetch_factor", "persistent_workers", "packing_budgets"):
             legacy_config.pop(name)
+        legacy_config.pop("metadata_mode", None)
         legacy_config.update(
             dataloader_options=options, dataset_reader_ranks=(0,), planner_rank=0,
             communication_device_type=None, uses_default_pack=True, uses_default_collate=True,
