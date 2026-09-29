@@ -404,10 +404,6 @@ def _build_fingerprint(topology: DataTopology, config_fingerprint: str) -> str:
 class _BuildState:
     """Rank-local components and partial validation results needed across build stages."""
 
-    metadata_mode: bool
-    model_config: Any = None
-    cost_model: CostModel | None = None
-    balancing_algorithm: BalancingAlgorithm | None = None
     topology: DataTopology | None = None
     dataset_reader_ranks: tuple[int, ...] | None = None
     planner_rank: int | None = None
@@ -506,7 +502,7 @@ def _configure_batch_sampler_sources(
     sample_loader = PlannedSampleLoader(dataset, seed=config.seed, **loader_options)
     sample_loader.set_epoch(batch_sampler.epoch)
     state.reader_size = len(dataset)
-    if state.metadata_mode:
+    if config.metadata_mode:
         if not callable(getattr(metadata, "__getitem__", None)) or len(metadata) != len(dataset):
             raise ValueError("Native batch_sampler metadata must align with the mapping Dataset.")
         state.direct_sample_loader = sample_loader
@@ -517,9 +513,9 @@ def _configure_batch_sampler_sources(
         batch_sampler, reader_rank=state.topology.global_rank,
         policy_fingerprint=sampler_fingerprint,
         metadata=metadata, metadata_fn=metadata_fn,
-        sample_loader=None if state.metadata_mode else sample_loader,
+        sample_loader=None if config.metadata_mode else sample_loader,
     )
-    if state.metadata_mode:
+    if config.metadata_mode:
         state.metadata_reader = reader
     else:
         state.dataset_reader = reader
@@ -552,6 +548,9 @@ def _finalize_build_state(
         uses_default_pack: bool,
         uses_default_collate: bool,
         batch_sampler_fingerprint: str | None,
+        model_config: Any,
+        cost_model: CostModel | None,
+        balancing_algorithm: BalancingAlgorithm | None,
 ) -> None:
     """Create the planner/constructor and stable build fingerprint."""
     state.planner = DynamicPackingPlanner(
@@ -561,9 +560,9 @@ def _finalize_build_state(
         oversized_policy=config.oversized_policy,
         packing_budgets=config.packing_budgets,
         min_balance_gain=config.min_balance_gain,
-        model_config=state.model_config,
-        cost_model=state.cost_model,
-        balancing_algorithm=state.balancing_algorithm,
+        model_config=model_config,
+        cost_model=cost_model,
+        balancing_algorithm=balancing_algorithm,
     )
     state.constructor = PackingDataConstructor(effective_pack_fn, effective_collate_fn, seq_len=config.seq_len)
     state.config_fingerprint = _config_fingerprint(
@@ -571,7 +570,7 @@ def _finalize_build_state(
         state.dataset_reader_ranks,
         state.planner_rank,
         dataloader_fingerprint=dataloader_fingerprint,
-        metadata_mode=state.metadata_mode,
+        metadata_mode=config.metadata_mode,
         communication_device_type=None if state.communication_device is None else state.communication_device.type,
         uses_default_pack=uses_default_pack,
         uses_default_collate=uses_default_collate,
@@ -605,6 +604,10 @@ def _populate_build_state(
         collate_fn: Callable[[Sequence[Any]], Any] | None,
         communication_device: Any,
         batch_sampler: Any = None,
+        *,
+        model_config: Any = None,
+        cost_model: CostModel | None = None,
+        balancing_algorithm: BalancingAlgorithm | None = None,
 ) -> None:
     if not isinstance(config, DistributedDatasetConfig):
         raise ValueError(f"config must be DistributedDatasetConfig, but got {type(config)}.")
@@ -628,7 +631,7 @@ def _populate_build_state(
     state.topology = DataTopology.from_mesh(mesh, dp_dim_names=config.dp_dim_names)
     state.dataset_reader_ranks, state.planner_rank = _resolve_service_ranks(state.topology, config)
     if batch_sampler is None:
-        if state.metadata_mode:
+        if config.metadata_mode:
             raise ValueError("Metadata mode requires batch_sampler to define step/sample boundaries.")
         raise ValueError("Online mode requires batch_sampler or external_step_source to define complete steps.")
     if config.metadata_mode:
@@ -652,6 +655,9 @@ def _populate_build_state(
         uses_default_pack,
         uses_default_collate,
         batch_sampler_fingerprint,
+        model_config,
+        cost_model,
+        balancing_algorithm,
     )
 
 
@@ -661,14 +667,15 @@ def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfi
         build_fingerprint = _build_fingerprint(state.topology, state.config_fingerprint)
     # Invalid configs must still participate in WORLD build preflight synchronization.
     dataset_already_sharded = isinstance(config, DistributedDatasetConfig) and config.dataset_already_sharded
-    is_direct_reader = state.metadata_mode and state.topology is not None and state.topology.is_constructor
+    metadata_mode = getattr(config, "metadata_mode", False)
+    is_direct_reader = metadata_mode and state.topology is not None and state.topology.is_constructor
     synchronize_build_preflight(
         build_fingerprint=build_fingerprint,
         is_reader=state.is_reader,
         reader_size=state.reader_size,
         is_direct_reader=is_direct_reader,
         direct_dataset_size=state.direct_dataset_size,
-        metadata_mode=state.metadata_mode,
+        metadata_mode=metadata_mode,
         dataset_already_sharded=dataset_already_sharded,
         local_error=state.local_error,
         communication_backend=getattr(config, "communication_backend", "hccl"),
@@ -880,11 +887,7 @@ def _build_distributed_dataloader_impl(
 ) -> DistributedDataLoader:
     if communication_device is None:
         communication_device = _resolve_device(communication_backend=getattr(config, "communication_backend", "hccl"))
-    metadata_mode = getattr(config, "metadata_mode", False)
-    state = _BuildState(
-        metadata_mode=metadata_mode, model_config=model_config,
-        cost_model=cost_model, balancing_algorithm=balancing_algorithm,
-    )
+    state = _BuildState()
     device_prefetch = None
     try:
         if getattr(config, "balance_group_size", None) is not None:
@@ -901,6 +904,9 @@ def _build_distributed_dataloader_impl(
             collate_fn,
             communication_device,
             batch_sampler,
+            model_config=model_config,
+            cost_model=cost_model,
+            balancing_algorithm=balancing_algorithm,
         )
         device = _resolve_device(communication_device)
         device_prefetch = _create_device_prefetcher(device, move_fn)
@@ -919,7 +925,7 @@ def _build_distributed_dataloader_impl(
         communication_device=(
             state.communication_device if config.communication_backend == "hccl" else None
         ),
-        enable_payload_exchange=not state.metadata_mode,
+        enable_payload_exchange=not config.metadata_mode,
         model_device=state.communication_device,
     )
 
@@ -930,7 +936,7 @@ def _build_distributed_dataloader_impl(
         dataset_reader=state.dataset_reader,
         metadata_reader=state.metadata_reader,
         direct_sample_loader=state.direct_sample_loader,
-        metadata_mode=state.metadata_mode,
+        metadata_mode=config.metadata_mode,
         planner=state.planner,
         data_constructor=state.constructor,
         data_plane=DataPlaneTransport(
