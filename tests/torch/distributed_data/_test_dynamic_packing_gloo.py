@@ -21,7 +21,7 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from hyper_parallel.distributed_data import (
     DistributedDatasetConfig, SampleMetadata, WorkloadCost, build_distributed_dataloader,
-    build_distributed_dataset, build_local_balancing_dataloader,
+    build_local_balancing_dataloader,
 )
 
 
@@ -54,10 +54,7 @@ def _run_local_steps(source_api: str) -> None:
         return SampleMetadata(5, cost=WorkloadCost(llm=sample["cost"]))
 
     options = {"cost_model": lambda metadata: metadata.cost, "device": "cpu", "max_steps": 2}
-    if source_api == "dataset":
-        dataset = build_distributed_dataset(steps, metadata=metadata_fn, collate_fn=tuple)
-        loader = build_distributed_dataloader(dataset, mesh, config, **options)
-    elif source_api == "source":
+    if source_api == "source":
         loader = build_distributed_dataloader(
             None, mesh, config, external_step_source=steps, metadata_fn=metadata_fn,
             pack_fn=lambda samples, _seq_len: tuple(samples), collate_fn=tuple, **options,
@@ -88,7 +85,7 @@ def test_dynamic_packing_dp4_gloo() -> None:
     """Run producer-defined steps through all node-local source entry points."""
     dist.init_process_group("gloo", timeout=timedelta(seconds=60))
     try:
-        for source_api in ("source", "dataset", "local"):
+        for source_api in ("source", "local"):
             _run_local_steps(source_api)
     finally:
         dist.destroy_process_group()

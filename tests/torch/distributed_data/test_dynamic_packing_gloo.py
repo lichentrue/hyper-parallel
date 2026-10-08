@@ -30,7 +30,7 @@ _WORKER = str(Path(__file__).resolve().parent / "_test_dynamic_packing_gloo.py")
 )
 def test_dynamic_packing_dp4_gloo() -> None:
     """Feature: Source-based node-local balancing.
-    Description: Run source, Dataset, and local-loader sample routing and step membership coverage.
+    Description: Run source and local-loader sample routing and step membership coverage.
     Expectation: All entry points preserve sample membership and balance the same two steps.
     """
     torchrun_case(

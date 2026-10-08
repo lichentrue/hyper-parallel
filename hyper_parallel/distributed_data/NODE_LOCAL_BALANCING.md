@@ -1,6 +1,6 @@
 # Node-local balancing
 
-Dataset-owned or external raw-step loading uses default backbone FLOPs,
+External raw-step loading uses default backbone FLOPs,
 capacity-constrained LPT, configurable node-local data exchange, automatic
 one-step buffering, and final H2D on a copy stream. Set
 `communication_backend="hccl"` (the default) with an NPU `device` to encode
@@ -11,7 +11,7 @@ without changing the data-plane backend.
 Set `balance_group_size` to partition the root mesh into fixed-size independent
 balancing groups. For example, `balance_group_size=1024` creates ten groups on
 a 10240-rank pure-DP mesh. Leave it unset to retain launcher/node grouping.
-This option applies only to the external-step and `DistributedDataset` paths;
+This option applies only to external-step loading;
 native `batch_sampler` loading keeps its global data plane.
 There is no enable switch: every step evaluates a candidate, but raw samples move only when
 the candidate's relative objective improvement is strictly greater than
@@ -56,16 +56,18 @@ blocking loss read can remove that window. Metadata sizes and the plan still
 need to reach the host, and payload encoding/split exchange run on the caller;
 the amount hidden depends on the remaining compute and shared bandwidth.
 
-## Dataset-based integration
+## External-step integration
 
-Construct the config, bind the source's existing data contract once, and build
-the loader. The application does not implement a balancing wrapper, a pack
-adapter, logging, or a device-prefetch consumption hook.
+Pass the existing selected-step source and its data callbacks directly to the
+loader builder. Hyper owns balancing, buffering and device handoff; the
+application defines metadata extraction, packing and optional field placement.
 
 ```python
+from contextlib import closing
+
 from hyper_parallel.distributed_data import (
     DistributedDatasetConfig,
-    build_distributed_dataset,
+    SampleMetadata,
     build_distributed_dataloader,
 )
 
@@ -76,37 +78,50 @@ config = DistributedDatasetConfig(
     min_balance_gain=0.0,
     balance_group_size=1024,
 )
-dataset = build_distributed_dataset(
-    source,
-    metadata="metadata",       # SampleMetadata already produced by the transform
-    collate_fn=model_collator,  # Existing collator, called once per accepted bin
-    cpu_fields=("cu_seqlens",),
-    log_fields=("P", "D"),     # Optional additive metadata.features fields
-)
-with build_distributed_dataloader(
-    dataset, mesh, config,
+
+
+def pack_samples(samples, seq_len):
+    # The model collator accepts payload fields only.
+    payloads = [{key: value for key, value in sample.items() if key != "metadata"} for sample in samples]
+    return model_collator(payloads)
+
+
+with closing(build_distributed_dataloader(
+    None, mesh, config,
+    external_step_source=source,
+    metadata_fn=lambda sample: SampleMetadata(len(sample["input_ids"]), features=sample["metadata"]),
+    pack_fn=pack_samples,
+    collate_fn=list,
     model_config=model_config,
     device=device,
     max_steps=train_steps,
-) as loader:
+)) as loader:
     for microbatches in loader:
         for batch in microbatches:
             train_microbatch(batch)
 ```
 
-- `DistributedDataset` wraps a selected-step source, not a new file reader.
-  It does not replace a model's processor, sampler or token-budget pack selector.
+- `external_step_source` accepts an existing selected-step source.
+  It preserves the model's processor, sampler and token-budget pack selector.
   Each source output is `[[sample, ...], ...]`, with one bin per microbatch.
   Use the original loader with final collation disabled to retain its selection
   behavior. A flat map-style dataset alone does not define those step boundaries.
-- `metadata` accepts either an existing `sample -> SampleMetadata` callable,
-  or a mapping field name containing precomputed `SampleMetadata`. A named
-  metadata field is omitted from the dictionaries passed to the collator.
-  The source is not consumed during dataset or loader construction.
-- `cpu_fields` names top-level fields of the collated mapping. Their complete
-  subtrees stay on CPU; other tensor leaves move recursively. Metadata and
-  collation remain application semantics, not model names embedded in Hyper.
-- `log_fields` selects numeric `SampleMetadata.features` to sum per bin.
+- `metadata_fn` maps each raw sample to `SampleMetadata`. It can read embedded
+  feature counters or compute metadata from the sample. Raw payloads must use
+  codec-supported values such as tensors, scalars, dictionaries, lists and tuples;
+  construct `SampleMetadata` in the callback rather than storing it in the payload.
+  Set `metadata_mode=False`
+  (the default) for this route, including when samples carry precomputed metadata.
+  The source is not consumed during loader construction.
+- `pack_fn(samples, seq_len)` constructs one accepted bin. Remove any embedded
+  metadata fields here if the model collator does not accept them; avoid mutating
+  source samples. `collate_fn` assembles all packed bins into one local step;
+  use `list` to yield a list of microbatches.
+- Optional `move_fn(batch, device)` controls per-microbatch H2D and can retain
+  CPU-only fields such as sequence offsets. Without it, tensor leaves move
+  recursively. It runs only when accelerator prefetch is enabled.
+- Optional `bin_stats_fn(samples)` receives an iterable of `SampleMetadata` and
+  returns per-bin counters, for example sums of numeric `features` fields.
   Generic sample/sequence/cost and send/receive logs need no extra callback.
   Configure the application's Python logging to include INFO messages.
 - Iteration returns ready device microbatches. The loader waits on the copy
@@ -142,8 +157,8 @@ with build_distributed_dataloader(
   not device-wide synchronization, to avoid draining the next step's copy.
 - This local-step route requires pure DP, equal step counts and a raw-step source.
   It does not support loader checkpoint/resume or native shared-metadata reads.
-  The dataset facade does not add checkpoint/resume. Use the native sampler
-  entry for checkpointable loading; it uses the same cost/algorithm contracts.
+  Use the native sampler entry for checkpointable loading; it uses the same
+  cost/algorithm contracts.
 
 ## Independent cost and assignment policies
 
@@ -155,7 +170,11 @@ Both policies are optional builder arguments. Omitting `cost_model` constructs
 from hyper_parallel.distributed_data import LPTBalancingAlgorithm
 
 loader = build_distributed_dataloader(
-    dataset, mesh, config, device=device,
+    None, mesh, config, device=device,
+    external_step_source=source,
+    metadata_fn=lambda sample: SampleMetadata(len(sample["input_ids"]), features=sample["metadata"]),
+    pack_fn=pack_samples,
+    collate_fn=list,
     cost_model=my_cost_model,
     balancing_algorithm=LPTBalancingAlgorithm(objective="makespan"),
 )
@@ -192,13 +211,9 @@ For checkpointable native sampler loading, stateful cost/algorithm objects
 should provide configuration-versioned `model_id` / `algorithm_id` attributes.
 Those identities participate in cross-rank build and checkpoint fingerprints.
 
-## Existing integrations
+## Native sampler integration
 
-The original `external_step_source`, `metadata_fn`, `pack_fn`, `move_fn` and
-`bin_stats_fn` arguments remain supported for existing users. That entry also
-returns device-ready batches and retains CPU views in `last_host_batch`.
-Do not mix those arguments with a `DistributedDataset`: the dataset owns all
-data callbacks. Plain Dataset + native BatchSampler retains its selection and
+Plain Dataset + native BatchSampler retains its selection and
 checkpoint mechanism, but now receives the same cost and algorithm parameters.
 It also requires `model_config` when no custom cost model is supplied.
 

@@ -16,8 +16,17 @@
 
 import unittest
 from collections.abc import Iterator
+from contextlib import closing
+from unittest.mock import Mock
 
-from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
+import torch
+
+from hyper_parallel.distributed_data import (
+    DistributedDatasetConfig,
+    SampleMetadata,
+    WorkloadCost,
+    build_distributed_dataloader,
+)
 from tests.common.mark_utils import arg_mark
 
 
@@ -65,6 +74,19 @@ def _build(source):
     )
 
 
+def _samples() -> list[dict]:
+    return [
+        {"input_ids": torch.tensor([index, index + 1]),
+         "metadata": SampleMetadata(2, cost=WorkloadCost(llm=index + 1), features={"images": index})}
+        for index in range(4)
+    ]
+
+
+def _pack(samples: list[dict], seq_len: int) -> dict:
+    del seq_len
+    return {"input_ids": torch.cat([sample["input_ids"] for sample in samples])}
+
+
 class TestExternalStepSource(unittest.TestCase):
     """Verify source iteration, metadata, and externally owned recovery."""
 
@@ -102,3 +124,94 @@ class TestExternalStepSource(unittest.TestCase):
             self.assertEqual(list(resumed), [[({"id": 1, "tokens": 5},)]])
         finally:
             resumed.close()
+
+
+class TestExternalStepCallbacks(unittest.TestCase):
+    """Verify raw-step callbacks, buffering and source lifecycle without process groups."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_enabled_balance_stops_prefetch_at_limit_and_reports_custom_cost(self) -> None:
+        """Feature: Buffered local balancing.
+        Description: Apply a custom cost model and an explicit one-step limit.
+        Expectation: Logging uses modeled costs and prefetch does not cross the limit.
+        """
+        samples = _samples()
+        reads = []
+
+        def source() -> Iterator[list[list[dict]]]:
+            """Record every physical source read, including speculative reads."""
+            for step in range(2):
+                reads.append(step)
+                yield [samples[step * 2:step * 2 + 2]]
+
+        config = DistributedDatasetConfig(seq_len=8, local_batch_size=1)
+        with closing(build_distributed_dataloader(
+                None, _Mesh(), config, device="cpu", max_steps=1,
+                external_step_source=source(), metadata_fn=lambda sample: sample["metadata"],
+                pack_fn=_pack, collate_fn=list,
+                bin_stats_fn=lambda samples: {"images": sum(sample.features["images"] for sample in samples)},
+                cost_model=lambda metadata: WorkloadCost(llm=metadata.cost.llm * 10),
+        )) as loader:
+            batch = next(loader)
+            self.assertEqual(batch[0]["input_ids"].tolist(), [0, 1, 1, 2])
+            stats = dict(loader.last_balance_stats)
+            self.assertEqual(stats["cost_before"], (30,))
+            self.assertEqual(stats["bins_after"][0][0]["images"], 1)
+            self.assertEqual(loader.group_ranks, (0,))
+            with self.assertRaises(StopIteration):
+                next(loader)
+        self.assertEqual(reads, [0])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_default_balancing_requires_backbone_dimensions(self) -> None:
+        """Feature: Default cost model.
+        Description: Build enabled balancing without model dimensions or a callback.
+        Expectation: Startup rejects the missing configuration.
+        """
+        with self.assertRaisesRegex(ValueError, "model_config"):
+            build_distributed_dataloader(
+                None, _Mesh(), DistributedDatasetConfig(seq_len=8, local_batch_size=1),
+                external_step_source=[], metadata_fn=lambda sample: sample["metadata"],
+                pack_fn=_pack, collate_fn=list, device="cpu",
+            )
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_epoch_and_checkpoint_contract(self) -> None:
+        """Feature: External source lifecycle.
+        Description: Change epochs and request unsupported local checkpoint operations.
+        Expectation: Epochs reach the source and checkpoint operations fail explicitly.
+        """
+        source = Mock()
+        source.__iter__ = Mock(side_effect=lambda: iter([[_samples()]]))
+        with closing(build_distributed_dataloader(
+                None, _Mesh(), DistributedDatasetConfig(seq_len=8, local_batch_size=1),
+                external_step_source=source, metadata_fn=lambda sample: sample["metadata"],
+                pack_fn=_pack, collate_fn=list, device="cpu", cost_model=lambda metadata: metadata.cost,
+        )) as loader:
+            first = next(loader)[0]["input_ids"]
+            loader.set_epoch(3)
+            source.set_epoch.assert_called_once_with(3)
+            self.assertEqual(loader.step, 0)
+            self.assertIsNone(loader.last_host_batch)
+            torch.testing.assert_close(next(loader)[0]["input_ids"], first)
+            with self.assertRaisesRegex(NotImplementedError, "checkpoint"):
+                loader.state_dict()
+            with self.assertRaisesRegex(NotImplementedError, "checkpoint"):
+                loader.load_state_dict({})
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_background_collator_error_reaches_consumer(self) -> None:
+        """Feature: Background failure propagation.
+        Description: Raise from a user collator on the producer thread.
+        Expectation: The waiting training thread receives the original exception.
+        """
+        failure = RuntimeError("collation failed")
+        with closing(build_distributed_dataloader(
+                None, _Mesh(), DistributedDatasetConfig(seq_len=8, local_batch_size=1),
+                external_step_source=[[_samples()]], metadata_fn=lambda sample: sample["metadata"],
+                pack_fn=Mock(side_effect=failure), collate_fn=list,
+                device="cpu", cost_model=lambda metadata: metadata.cost,
+        )) as loader:
+            with self.assertRaises(RuntimeError) as caught:
+                next(loader)
+            self.assertIs(caught.exception, failure)

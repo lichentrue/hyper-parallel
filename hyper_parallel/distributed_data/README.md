@@ -80,16 +80,16 @@ and the final sample-conservation audit (when `validate=True`) remain unchanged.
 
 ## Public API
 
-External applications can bind their source, metadata, collator and CPU field
-policy with `build_distributed_dataset`, then pass that object and a
-`DistributedDatasetConfig` to `build_distributed_dataloader`. This path
+External applications pass their selected steps as `external_step_source` to
+`build_distributed_dataloader`, alongside `DistributedDatasetConfig` and the
+`metadata_fn`, `pack_fn`, `collate_fn` and optional `move_fn` callbacks. This path
 automatically evaluates node-local balancing, double buffers and stages H2D,
 and yields ready device microbatches. Sample exchange occurs only when the
 algorithm's objective improves by more than `min_balance_gain`.
 Set `balance_group_size` to partition a large pure-DP mesh into independent
 balancing groups, such as ten 1024-rank groups on a 10240-rank job. Native
 BatchSampler loading does not use this option and retains its global data plane.
-See [dataset-based integration](NODE_LOCAL_BALANCING.md) for the complete
+See [external-step integration](NODE_LOCAL_BALANCING.md) for the complete
 contract. `cost_model` and `balancing_algorithm` are independently replaceable.
 Native BatchSampler loading retains its selection/checkpoint mechanisms and
 uses these same policy arguments; default costs require `model_config`.
@@ -98,7 +98,6 @@ uses these same policy arguments; default costs require `model_config`.
 from hyper_parallel.distributed_data import (
     DistributedDatasetConfig,
     SampleMetadata,
-    build_distributed_dataset,
     build_distributed_dataloader,
 )
 ```

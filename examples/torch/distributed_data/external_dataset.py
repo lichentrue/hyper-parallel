@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU example: config -> dataset contract -> device-ready dataloader.
+"""CPU example: raw-step source and callbacks -> device-ready dataloader.
 
 Run with ``torchrun --master-addr=127.0.0.1 --nproc-per-node=2
 examples/torch/distributed_data/external_dataset.py``.
 """
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from contextlib import closing
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -30,7 +31,6 @@ from hyper_parallel.distributed_data import (
     DistributedDatasetConfig,
     SampleMetadata,
     build_distributed_dataloader,
-    build_distributed_dataset,
 )
 
 MODEL_CONFIG = {
@@ -60,6 +60,40 @@ def collate_tokens(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def pack_tokens(samples: Sequence[dict[str, Any]], seq_len: int) -> dict[str, Any]:
+    """Pass one accepted bin to the model collator without its planning metadata.
+
+    Args:
+        samples: Raw samples assigned to one bin.
+        seq_len: Token capacity already enforced by the planner.
+    """
+    del seq_len
+    return collate_tokens([{key: value for key, value in sample.items() if key != "metadata"} for sample in samples])
+
+
+def move_tokens(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    """Move model inputs while keeping sequence offsets on the host.
+
+    Args:
+        batch: One packed microbatch.
+        device: Rank-local training device.
+    """
+    return {"input_ids": batch["input_ids"].to(device, non_blocking=True), "offsets": batch["offsets"]}
+
+
+def summarize_tokens(samples: Iterable[SampleMetadata]) -> dict[str, int]:
+    """Sum additive token counters for one bin's balance log.
+
+    Args:
+        samples: Metadata entries assigned to the bin.
+    """
+    totals = {"P": 0, "D": 0}
+    for sample in samples:
+        for name in totals:
+            totals[name] += sample.features[name]
+    return totals
+
+
 def main() -> None:
     """Bind already-selected steps and consume batches with a normal loop."""
     logging.basicConfig(level=logging.INFO)
@@ -70,19 +104,21 @@ def main() -> None:
     source = [
         [[{
             "input_ids": torch.full((length,), rank + step, dtype=torch.int64),
-            "metadata": SampleMetadata(pack_tokens=length, features={"P": length, "D": 0}),
+            "metadata": {"P": length, "D": 0},
         } for length in lengths]]
         for step in range(3)
     ]
-    config = DistributedDatasetConfig(seq_len=300, local_batch_size=1, min_balance_gain=0.0)
-    dataset = build_distributed_dataset(
-        source, metadata="metadata", collate_fn=collate_tokens,
-        cpu_fields=("offsets",), log_fields=("P", "D"),
+    config = DistributedDatasetConfig(
+        seq_len=300, local_batch_size=1, min_balance_gain=0.0, communication_backend="gloo",
     )
     try:
-        with build_distributed_dataloader(
-            dataset, mesh, config, model_config=MODEL_CONFIG, device="cpu", max_steps=3,
-        ) as loader:
+        with closing(build_distributed_dataloader(
+            None, mesh, config, external_step_source=source,
+            metadata_fn=lambda sample: SampleMetadata(len(sample["input_ids"]), features=sample["metadata"]),
+            pack_fn=pack_tokens, collate_fn=list,
+            move_fn=move_tokens, bin_stats_fn=summarize_tokens,
+            model_config=MODEL_CONFIG, device="cpu", max_steps=3,
+        )) as loader:
             for microbatches in loader:
                 logging.info("rank=%d step=%d tokens=%d", rank, loader.step, microbatches[0]["input_ids"].numel())
     finally:
