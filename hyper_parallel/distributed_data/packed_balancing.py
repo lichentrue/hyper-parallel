@@ -241,7 +241,6 @@ class LocalBalancingDataLoader:
             planner: Any,
             transport: DataPlaneTransport,
             global_rank: int,
-            bin_stats_fn: Callable[[Iterable[SampleMetadata]], dict[str, Any]] | None = None,
             device_prefetch: DeviceStepPrefetcher | None = None,
             max_steps: int | None = None,
             balance_stats_callback: Callable[[dict[str, Any], int, int | None], None] | None = None,
@@ -257,7 +256,6 @@ class LocalBalancingDataLoader:
         self.last_balance_stats: dict[str, Any] | None = None
         self.last_host_batch: Any = None
         self._metadata_fn = metadata_fn
-        self._bin_stats_fn = bin_stats_fn
         self._pack_fn = pack_fn
         self._collate_fn = collate_fn
         self._planner = planner
@@ -490,7 +488,6 @@ class LocalBalancingDataLoader:
         for key_bins, _ in gathered:
             before.append(tuple(
                 {
-                    **(self._bin_stats_fn(metadata_by_key[key] for key in keys) if self._bin_stats_fn else {}),
                     "samples": len(keys),
                     "seq_len": sum(metadata_by_key[key].pack_tokens for key in keys),
                     "cost": sum((cost_by_key[key] for key in keys), 0.0),
@@ -500,8 +497,6 @@ class LocalBalancingDataLoader:
         after = tuple(
             tuple(
                 {
-                    **(self._bin_stats_fn(metadata_by_key[key] for key in packing_bin.sample_keys)
-                       if self._bin_stats_fn else {}),
                     "samples": len(packing_bin.sample_keys),
                     "seq_len": packing_bin.pack_tokens,
                     "cost": sum((cost_by_key[key] for key in packing_bin.sample_keys), 0.0),
@@ -564,7 +559,6 @@ def build_local_balancing_dataloader(
         cost_model: CostModel | None = None,
         balancing_algorithm: BalancingAlgorithm | None = None,
         device: Any = None,
-        bin_stats_fn: Callable[[Iterable[SampleMetadata]], dict[str, Any]] | None = None,
         max_steps: int | None = None,
 ) -> LocalBalancingDataLoader:
     """Build the fixed node-local balancing pipeline over complete raw steps.
@@ -584,7 +578,6 @@ def build_local_balancing_dataloader(
             Costs and the improvement gate remain framework-owned.
         device: Training device; defaults to CPU with Gloo, otherwise the current
             accelerator. Pass an explicit NPU/CUDA device for H2D with Gloo.
-        bin_stats_fn: Optional CPU-only per-bin counters for the rank-zero log.
         max_steps: Stop before prefetching beyond the requested training steps.
 
     Returns:
@@ -644,7 +637,6 @@ def build_local_balancing_dataloader(
             communication_device=communication_device,
         ),
         global_rank=topology.global_rank,
-        bin_stats_fn=bin_stats_fn,
         device_prefetch=device_prefetch,
         max_steps=max_steps,
         balance_stats_callback=log_balance_stats,

@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from multiprocessing.context import BaseContext
 from typing import Any, Literal
@@ -709,7 +709,6 @@ def build_distributed_dataloader(
         model_config: Any = None,
         cost_model: CostModel | None = None,
         balancing_algorithm: BalancingAlgorithm | None = None,
-        bin_stats_fn: Callable[[Iterable[SampleMetadata]], dict[str, Any]] | None = None,
         max_steps: int | None = None,
 ) -> DistributedDataLoader | LocalBalancingDataLoader:
     """Build a sample-balanced distributed DataLoader.
@@ -776,7 +775,6 @@ def build_distributed_dataloader(
         cost_model: Optional user workload callback replacing the default.
         balancing_algorithm: Optional assignment and objective policy. Receives
             already-scored samples; Hyper enforces capacities and the gain gate.
-        bin_stats_fn: Optional per-bin counters in the local-step rank-zero log.
         max_steps: Local-step step limit, including speculative prefetch.
 
     Returns:
@@ -815,7 +813,6 @@ def build_distributed_dataloader(
             cost_model=cost_model,
             balancing_algorithm=balancing_algorithm,
             device=device,
-            bin_stats_fn=bin_stats_fn,
             max_steps=max_steps,
         )
     return _build_distributed_dataloader_impl(

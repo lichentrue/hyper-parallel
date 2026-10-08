@@ -19,7 +19,7 @@ examples/torch/distributed_data/external_dataset.py``.
 """
 
 import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from contextlib import closing
 from typing import Any
 
@@ -71,19 +71,6 @@ def pack_tokens(samples: Sequence[dict[str, Any]], seq_len: int) -> dict[str, An
     return collate_tokens([{key: value for key, value in sample.items() if key != "metadata"} for sample in samples])
 
 
-def summarize_tokens(samples: Iterable[SampleMetadata]) -> dict[str, int]:
-    """Sum additive token counters for one bin's balance log.
-
-    Args:
-        samples: Metadata entries assigned to the bin.
-    """
-    totals = {"P": 0, "D": 0}
-    for sample in samples:
-        for name in totals:
-            totals[name] += sample.features[name]
-    return totals
-
-
 def main() -> None:
     """Bind already-selected steps and consume batches with a normal loop."""
     logging.basicConfig(level=logging.INFO)
@@ -106,7 +93,6 @@ def main() -> None:
             None, mesh, config, external_step_source=source,
             metadata_fn=lambda sample: SampleMetadata(len(sample["input_ids"]), features=sample["metadata"]),
             pack_fn=pack_tokens, collate_fn=list,
-            bin_stats_fn=summarize_tokens,
             model_config=MODEL_CONFIG, device="cpu", max_steps=3,
         )) as loader:
             for microbatches in loader:

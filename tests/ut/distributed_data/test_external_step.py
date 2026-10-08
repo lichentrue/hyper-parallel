@@ -77,7 +77,7 @@ def _build(source):
 def _samples() -> list[dict]:
     return [
         {"input_ids": torch.tensor([index, index + 1]),
-         "metadata": SampleMetadata(2, cost=WorkloadCost(llm=index + 1), features={"images": index})}
+         "metadata": SampleMetadata(2, cost=WorkloadCost(llm=index + 1))}
         for index in range(4)
     ]
 
@@ -149,14 +149,17 @@ class TestExternalStepCallbacks(unittest.TestCase):
                 None, _Mesh(), config, device="cpu", max_steps=1,
                 external_step_source=source(), metadata_fn=lambda sample: sample["metadata"],
                 pack_fn=_pack, collate_fn=list,
-                bin_stats_fn=lambda samples: {"images": sum(sample.features["images"] for sample in samples)},
                 cost_model=lambda metadata: WorkloadCost(llm=metadata.cost.llm * 10),
         )) as loader:
-            batch = next(loader)
+            with self.assertLogs("hyper_parallel.distributed_data.balance_logging", level="INFO") as logs:
+                batch = next(loader)
             self.assertEqual(batch[0]["input_ids"].tolist(), [0, 1, 1, 2])
             stats = dict(loader.last_balance_stats)
             self.assertEqual(stats["cost_before"], (30,))
-            self.assertEqual(stats["bins_after"][0][0]["images"], 1)
+            self.assertEqual(stats["bins_before"][0][0], {"samples": 2, "seq_len": 4, "cost": 30})
+            self.assertEqual(stats["bins_after"][0][0], {"samples": 2, "seq_len": 4, "cost": 30})
+            self.assertIn("mb0: seq_len=4, samples=2, cost=30", logs.output[0])
+            self.assertIn("dp0: send 0 samples, recv 0 samples", logs.output[0])
             self.assertEqual(loader.group_ranks, (0,))
             with self.assertRaises(StopIteration):
                 next(loader)

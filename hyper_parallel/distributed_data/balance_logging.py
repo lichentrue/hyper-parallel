@@ -28,24 +28,9 @@ def _layout_lines(label: str, ranks: Sequence[int], layout: Sequence[Any]) -> li
     for rank, bins in zip(ranks, layout):
         microbatches = []
         for index, stats in enumerate(bins):
-            fields = []
-            displayed = {"seq_len", "samples", "cost"}
-            if all(name in stats for name in ("vae_gen", "vae_cond", "vit")):
-                fields.append(
-                    f"images(vae_gen={stats['vae_gen']}, vae_cond={stats['vae_cond']}, vit={stats['vit']})"
-                )
-                displayed.update(("vae_gen", "vae_cond", "vit"))
-            sequence = f"seq_len={stats['seq_len']}"
-            if "P" in stats and "D" in stats:
-                sequence += f" (P={stats['P']}, D={stats['D']})"
-                displayed.update(("P", "D"))
-            fields.extend((sequence, f"samples={stats['samples']}"))
-            if "pixel_numel" in stats:
-                fields.append(f"pixel_numel={stats['pixel_numel']}")
-                displayed.add("pixel_numel")
-            fields.append(f"cost={stats['cost']:.12g}")
-            fields.extend(f"{name}={value}" for name, value in stats.items() if name not in displayed)
-            microbatches.append(f"mb{index}: " + ", ".join(fields))
+            microbatches.append(
+                f"mb{index}: seq_len={stats['seq_len']}, samples={stats['samples']}, cost={stats['cost']:.12g}"
+            )
         lines.append(f"  dp{rank}: " + " | ".join(microbatches))
     return lines
 
@@ -54,8 +39,8 @@ def format_balance_stats(stats: dict[str, Any], step: int, max_steps: int | None
     """Format original/accepted microbatch layouts with raw predicted LLM costs.
 
     Args:
-        stats: Statistics produced by the local balancing loader. Image counts,
-            P/D and pixel elements are optional application ``bin_stats_fn`` fields.
+        stats: Sample counts, sequence lengths, predicted costs and transfers
+            produced by the local balancing loader.
         step: One-based iteration number.
         max_steps: Optional iteration limit, displayed as ``iteration step/total``.
 

@@ -120,9 +120,8 @@ with closing(build_distributed_dataloader(
 - Accelerator prefetch recursively moves tensor leaves to the training device,
   preserving dtype and non-tensor metadata. Batch objects with a `to` method use
   that method. CPU execution keeps batches on the host.
-- Optional `bin_stats_fn(samples)` receives an iterable of `SampleMetadata` and
-  returns per-bin counters, for example sums of numeric `features` fields.
-  Generic sample/sequence/cost and send/receive logs need no extra callback.
+- Balance logs report per-bin sample counts, token counts and predicted costs,
+  plus per-rank send/receive counts and the balancing decision.
   Configure the application's Python logging to include INFO messages.
 - Iteration returns ready device microbatches. The loader waits on the copy
   event and records storage on the consumer stream internally. No explicit
