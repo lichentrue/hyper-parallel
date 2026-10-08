@@ -20,7 +20,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from hyper_parallel.distributed_data.device_prefetch import DeviceStepPrefetcher, _resolve_device
+from hyper_parallel.distributed_data.device_prefetch import DeviceStepPrefetcher, _move_to_device, _resolve_device
 from tests.common.mark_utils import arg_mark
 
 
@@ -38,6 +38,32 @@ class _DeviceBatch:
 
 class TestDeviceStepPrefetcher(unittest.TestCase):
     """Verify copy-stream launch, event ordering, and slot lifecycle."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_recursive_transfer_moves_all_tensor_fields(self) -> None:
+        """Feature: Uniform device placement.
+        Description: Transfer nested inputs, offsets and labels to a hardware-free meta device.
+        Expectation: All tensor leaves move without dtype changes; host inputs and scalar metadata survive.
+        """
+        batch = {
+            "input_ids": torch.tensor([1, 2], dtype=torch.int64),
+            "offsets": torch.tensor([0, 2], dtype=torch.int32),
+            "nested": [{"labels": (torch.tensor([1.0, 2.0]),)}],
+            "metadata": {"name": "sample", "length": 2, "optional": None},
+        }
+        moved = _move_to_device(batch, torch.device("meta"))
+        for host, device in (
+                (batch["input_ids"], moved["input_ids"]),
+                (batch["offsets"], moved["offsets"]),
+                (batch["nested"][0]["labels"][0], moved["nested"][0]["labels"][0]),
+        ):
+            self.assertEqual(device.device.type, "meta")
+            self.assertEqual(device.dtype, host.dtype)
+            self.assertEqual(device.shape, host.shape)
+            self.assertEqual(host.device.type, "cpu")
+        self.assertIsInstance(moved["nested"], list)
+        self.assertIsInstance(moved["nested"][0]["labels"], tuple)
+        self.assertEqual(moved["metadata"], batch["metadata"])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_gloo_device_selection_does_not_probe_accelerators(self) -> None:
@@ -62,8 +88,10 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
         move = Mock(side_effect=[object(), RuntimeError("copy failed")])
         with patch.object(torch, "cuda", accelerator), patch(
                 "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
+        ), patch(
+                "hyper_parallel.distributed_data.device_prefetch._move_to_device", move,
         ):
-            prefetcher = DeviceStepPrefetcher("cuda:0", move_fn=move)
+            prefetcher = DeviceStepPrefetcher("cuda:0")
             with self.assertRaisesRegex(RuntimeError, "copy failed"):
                 prefetcher([{"host": 1}, {"host": 2}])
             accelerator.Stream.return_value.synchronize.assert_called_once()
@@ -83,7 +111,7 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
         with patch.object(torch, "cuda", accelerator), patch(
                 "hyper_parallel.distributed_data.device_prefetch._pin_memory", return_value=pinned,
         ):
-            prefetcher = DeviceStepPrefetcher("cuda:0", move_fn=lambda batch, device: {})
+            prefetcher = DeviceStepPrefetcher("cuda:0")
             prefetcher([{"host": 1}])
             self.assertIs(prefetcher._pending_staging[0][1][0], pinned)
             accelerator.Event.return_value.synchronize.assert_not_called()
@@ -103,8 +131,10 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
         device_batch = _DeviceBatch(events)
         with patch.object(torch, "cuda", accelerator), patch(
                 "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
+        ), patch(
+                "hyper_parallel.distributed_data.device_prefetch._move_to_device", return_value=device_batch,
         ):
-            prefetcher = DeviceStepPrefetcher("cuda:0", move_fn=lambda _batch, _device: device_batch)
+            prefetcher = DeviceStepPrefetcher("cuda:0")
             first = prefetcher([{"host": 1}])
             prefetcher([{"host": 2}])
             self.assertEqual(accelerator.set_device.call_count, 2)

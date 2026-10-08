@@ -141,6 +141,8 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 }
                 with patch.object(torch, "cuda", accelerator), patch(
                         "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
+                ), patch(
+                        "hyper_parallel.distributed_data.device_prefetch._move_to_device", side_effect=move,
                 ):
                     with build_distributed_dataloader(
                             list(range(6)), _StandaloneMesh(),
@@ -148,7 +150,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                                 seq_len=10, local_batch_size=2, communication_backend="gloo",
                                 metadata_mode=metadata_mode,
                             ),
-                            batch_sampler=_sampler(), device="cuda:0", move_fn=move,
+                            batch_sampler=_sampler(), device="cuda:0",
                             cost_model=lambda metadata: metadata.cost, **options,
                     ) as loader:
                         broadcast = Mock(side_effect=lambda value: value)

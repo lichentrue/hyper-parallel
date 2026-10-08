@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -127,7 +127,7 @@ class DevicePrefetchedStep:
             index: Position of an unconsumed microbatch in this step.
 
         Returns:
-            Device microbatch, with retained CPU metadata left untouched.
+            Device microbatch, with non-tensor metadata left untouched.
         """
         accelerator = getattr(torch, self.device.type)
         stream = accelerator.current_stream(self.device)
@@ -147,26 +147,16 @@ class DeviceStepPrefetcher:
     Host view for metrics and takes device microbatches immediately before use.
     """
 
-    def __init__(
-            self,
-            device: Any,
-            *,
-            move_fn: Callable[[Any, torch.device], Any] | None = None,
-    ) -> None:
+    def __init__(self, device: Any) -> None:
         """Configure final input transfer without allocating a device stream.
 
         Args:
             device: Target CUDA or NPU device, independent of payload transport.
-            move_fn: Optional per-microbatch field mapping/H2D callback. The
-                default recursively moves tensors and standard containers.
         """
         self.device = torch.device(device)
         if self.device.type not in ("cuda", "npu"):
             raise ValueError("DeviceStepPrefetcher requires a CUDA or NPU device.")
-        if move_fn is not None and not callable(move_fn):
-            raise ValueError("move_fn must be callable or None.")
         self._accelerator = _accelerator_module(self.device)
-        self._move_fn = _move_to_device if move_fn is None else move_fn
         self._copy_stream = None
         self._pending_staging: list[tuple[Any, list[Any]]] = []
 
@@ -199,7 +189,7 @@ class DeviceStepPrefetcher:
         try:
             with accelerator.stream(self._copy_stream):
                 for micro_batch in staging:
-                    device_micro_batches.append(self._move_fn(micro_batch, self.device))
+                    device_micro_batches.append(_move_to_device(micro_batch, self.device))
                 ready_event = accelerator.Event()
                 ready_event.record(self._copy_stream)
         except BaseException:
@@ -232,15 +222,12 @@ def _resolve_device(device: Any = None, *, communication_backend: str = "hccl") 
     return torch.device(device)
 
 
-def _create_device_prefetcher(
-        device: Any = None,
-        move_fn: Callable[[Any, torch.device], Any] | None = None,
-) -> DeviceStepPrefetcher | None:
+def _create_device_prefetcher(device: Any = None) -> DeviceStepPrefetcher | None:
     """Create producer-owned H2D only when an accelerator is selected."""
     device = _resolve_device(device)
     if device.type == "cpu":
         return None
-    return DeviceStepPrefetcher(device, move_fn=move_fn)
+    return DeviceStepPrefetcher(device)
 
 
 __all__ = ["DeviceStepPrefetcher"]

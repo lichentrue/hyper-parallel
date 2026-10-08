@@ -564,7 +564,6 @@ def build_local_balancing_dataloader(
         cost_model: CostModel | None = None,
         balancing_algorithm: BalancingAlgorithm | None = None,
         device: Any = None,
-        move_fn: Callable[[Any, Any], Any] | None = None,
         bin_stats_fn: Callable[[Iterable[SampleMetadata]], dict[str, Any]] | None = None,
         max_steps: int | None = None,
 ) -> LocalBalancingDataLoader:
@@ -585,8 +584,6 @@ def build_local_balancing_dataloader(
             Costs and the improvement gate remain framework-owned.
         device: Training device; defaults to CPU with Gloo, otherwise the current
             accelerator. Pass an explicit NPU/CUDA device for H2D with Gloo.
-        move_fn: Optional per-microbatch tensor mapping to the training device;
-            use it to retain fields that must stay on CPU.
         bin_stats_fn: Optional CPU-only per-bin counters for the rank-zero log.
         max_steps: Stop before prefetching beyond the requested training steps.
 
@@ -605,7 +602,7 @@ def build_local_balancing_dataloader(
     cost_model = resolve_cost_model(cost_model, model_config)
     balancing_algorithm = resolve_balancing_algorithm(balancing_algorithm)
     device = _resolve_device(device, communication_backend=config.communication_backend)
-    device_prefetch = _create_device_prefetcher(device, move_fn)
+    device_prefetch = _create_device_prefetcher(device)
     if not all(callable(callback) for callback in (metadata_fn, pack_fn, collate_fn)):
         raise ValueError("metadata_fn, pack_fn and collate_fn must be callable.")
     if not hasattr(local_dataloader, "__iter__"):

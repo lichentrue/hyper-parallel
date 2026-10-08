@@ -82,7 +82,7 @@ and the final sample-conservation audit (when `validate=True`) remain unchanged.
 
 External applications pass their selected steps as `external_step_source` to
 `build_distributed_dataloader`, alongside `DistributedDatasetConfig` and the
-`metadata_fn`, `pack_fn`, `collate_fn` and optional `move_fn` callbacks. This path
+`metadata_fn`, `pack_fn` and `collate_fn` callbacks. This path
 automatically evaluates node-local balancing, double buffers and stages H2D,
 and yields ready device microbatches. Sample exchange occurs only when the
 algorithm's objective improves by more than `min_balance_gain`.
@@ -348,10 +348,12 @@ metadata mode still skips payload A2A.
 `next(loader)` returns device-ready inputs. One shared producer-owned copy
 stage pins host tensors, enqueues non-blocking H2D on a separate stream, and
 records a ready event. The consumer stream waits on that event and records
-storage ownership before model broadcast or training uses the inputs. A
-`move_fn(batch, device)` can retain CPU-only fields or perform model-specific
-preparation; HP does not hard-code CP/UND masks. For source-only local steps,
-`move_fn` runs per microbatch; for samplers it runs on the collated batch.
+storage ownership before model broadcast or training uses the inputs.
+Tensor leaves in standard containers move recursively without changing dtype;
+non-tensor metadata remains unchanged. Batch objects with a `to` method use that
+method. For source-only local steps, copies run per microbatch; for samplers they
+run on the collated batch. Local-step loaders retain CPU inputs in
+`last_host_batch` for host metering.
 The old standalone trainer-owned device-prefetch slot has been removed.
 
 HCCL/NCCL collectives must be launched on the training thread in a consistent

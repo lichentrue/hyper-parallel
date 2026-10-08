@@ -60,7 +60,7 @@ the amount hidden depends on the remaining compute and shared bandwidth.
 
 Pass the existing selected-step source and its data callbacks directly to the
 loader builder. Hyper owns balancing, buffering and device handoff; the
-application defines metadata extraction, packing and optional field placement.
+application defines metadata extraction and packing.
 
 ```python
 from contextlib import closing
@@ -117,9 +117,9 @@ with closing(build_distributed_dataloader(
   metadata fields here if the model collator does not accept them; avoid mutating
   source samples. `collate_fn` assembles all packed bins into one local step;
   use `list` to yield a list of microbatches.
-- Optional `move_fn(batch, device)` controls per-microbatch H2D and can retain
-  CPU-only fields such as sequence offsets. Without it, tensor leaves move
-  recursively. It runs only when accelerator prefetch is enabled.
+- Accelerator prefetch recursively moves tensor leaves to the training device,
+  preserving dtype and non-tensor metadata. Batch objects with a `to` method use
+  that method. CPU execution keeps batches on the host.
 - Optional `bin_stats_fn(samples)` receives an iterable of `SampleMetadata` and
   returns per-bin counters, for example sums of numeric `features` fields.
   Generic sample/sequence/cost and send/receive logs need no extra callback.

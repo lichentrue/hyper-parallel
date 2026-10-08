@@ -71,16 +71,6 @@ def pack_tokens(samples: Sequence[dict[str, Any]], seq_len: int) -> dict[str, An
     return collate_tokens([{key: value for key, value in sample.items() if key != "metadata"} for sample in samples])
 
 
-def move_tokens(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
-    """Move model inputs while keeping sequence offsets on the host.
-
-    Args:
-        batch: One packed microbatch.
-        device: Rank-local training device.
-    """
-    return {"input_ids": batch["input_ids"].to(device, non_blocking=True), "offsets": batch["offsets"]}
-
-
 def summarize_tokens(samples: Iterable[SampleMetadata]) -> dict[str, int]:
     """Sum additive token counters for one bin's balance log.
 
@@ -116,7 +106,7 @@ def main() -> None:
             None, mesh, config, external_step_source=source,
             metadata_fn=lambda sample: SampleMetadata(len(sample["input_ids"]), features=sample["metadata"]),
             pack_fn=pack_tokens, collate_fn=list,
-            move_fn=move_tokens, bin_stats_fn=summarize_tokens,
+            bin_stats_fn=summarize_tokens,
             model_config=MODEL_CONFIG, device="cpu", max_steps=3,
         )) as loader:
             for microbatches in loader:

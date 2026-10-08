@@ -1143,7 +1143,7 @@ class ModelParallelTransport:
         received_tensors = []
         for index, spec in enumerate(tensor_specs):
             tensor_group = self._group_for_tensor(spec[2])
-            # A move_fn may retain CPU-only fields even with HCCL control.
+            # CPU batches can use accelerator-backed model groups.
             # Stage those leaves for transport, then restore their CPU placement.
             host_over_device = spec[2] == "cpu" and _is_accelerator_backend(_control_backend(tensor_group))
             device = self._communication_device if host_over_device else _tensor_device(spec[2], tensor_group)

@@ -25,7 +25,7 @@ from tests.common.mark_utils import arg_mark
 def test_buffered_device_loading_hccl() -> None:
     """Feature: Buffered accelerator data loading.
     Description: Exercise DP2/TP2 native loading and DP4 sources with asynchronous H2D.
-    Expectation: Device inputs, CPU-only fields and sample membership survive collective transport.
+    Expectation: All tensor fields reach the device and sample membership survives collective transport.
     """
     torchrun_case(
         file_name=str(Path(__file__).with_name("_test_buffered_device_loading_hccl.py")),

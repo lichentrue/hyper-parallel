@@ -28,7 +28,7 @@ from hyper_parallel.distributed_data import (
 
 
 class _Dataset:
-    """Return CPU tensors with one field deliberately retained on the host."""
+    """Return CPU tensors whose complete batch must move to the training device."""
 
     def __len__(self) -> int:
         """Return three complete global steps."""
@@ -41,10 +41,6 @@ class _Dataset:
 
 def _metadata(sample: dict) -> SampleMetadata:
     return SampleMetadata(2, cost=WorkloadCost(llm=9 if sample["id"] % 4 < 2 else 1))
-
-
-def _move(batch: tuple, device: torch.device) -> tuple:
-    return tuple({**sample, "input_ids": sample["input_ids"].to(device, non_blocking=True)} for sample in batch)
 
 
 def _native(device: torch.device, backend: str, metadata_mode: bool) -> None:
@@ -61,7 +57,7 @@ def _native(device: torch.device, backend: str, metadata_mode: bool) -> None:
             dataset, mesh, DistributedDatasetConfig(
                 seq_len=8, local_batch_size=2, communication_backend=backend, metadata_mode=metadata_mode,
             ),
-            batch_sampler=sampler, device=device, move_fn=_move,
+            batch_sampler=sampler, device=device,
             cost_model=lambda metadata: metadata.cost, **options,
     ) as loader:
         for step in range(3):
@@ -70,7 +66,8 @@ def _native(device: torch.device, backend: str, metadata_mode: bool) -> None:
                 assert sample["input_ids"].device == device, (
                     f"Wrong device: got={sample['input_ids'].device}, expected={device}"
                 )
-                assert sample["offsets"].device.type == "cpu", f"CPU field moved: {sample['offsets'].device}"
+                assert sample["offsets"].device == device, f"Offsets did not move: {sample['offsets'].device}"
+                assert sample["offsets"].tolist() == [0, 2], f"Offsets changed: {sample['offsets']}"
                 assert sample["input_ids"].tolist() == [sample["id"], sample["id"] + 1], (
                     f"Incomplete H2D or MP broadcast: sample={sample}"
                 )
@@ -105,13 +102,15 @@ def _local(device: torch.device) -> None:
         None, mesh, DistributedDatasetConfig(seq_len=8, local_batch_size=1),
         external_step_source=source, metadata_fn=_metadata,
         pack_fn=lambda samples, _: tuple(samples), collate_fn=list,
-        cost_model=lambda metadata: metadata.cost, device=device, move_fn=_move,
+        cost_model=lambda metadata: metadata.cost, device=device,
     )
     try:
         for step in range(3):
             batch = next(loader)[0]
             assert batch[0]["input_ids"].device == device, f"Local source did not return device data: {batch}"
+            assert batch[0]["offsets"].device == device, f"Local offsets did not move: {batch}"
             assert loader.last_host_batch[0][0]["input_ids"].device.type == "cpu", "Host metering view moved"
+            assert loader.last_host_batch[0][0]["offsets"].device.type == "cpu", "Host offsets moved"
             loader.prefetch_plan()
             loader.prefetch()
             assert batch[0]["input_ids"][0].item() == step * 4 + rank, f"Local step changed: {batch}"

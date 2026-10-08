@@ -709,7 +709,6 @@ def build_distributed_dataloader(
         model_config: Any = None,
         cost_model: CostModel | None = None,
         balancing_algorithm: BalancingAlgorithm | None = None,
-        move_fn: Callable[[Any, Any], Any] | None = None,
         bin_stats_fn: Callable[[Iterable[SampleMetadata]], dict[str, Any]] | None = None,
         max_steps: int | None = None,
 ) -> DistributedDataLoader | LocalBalancingDataLoader:
@@ -777,8 +776,6 @@ def build_distributed_dataloader(
         cost_model: Optional user workload callback replacing the default.
         balancing_algorithm: Optional assignment and objective policy. Receives
             already-scored samples; Hyper enforces capacities and the gain gate.
-        move_fn: H2D field mapping; retain CPU-only metadata here. Called per
-            microbatch for local-step sources, or per collated batch for samplers.
         bin_stats_fn: Optional per-bin counters in the local-step rank-zero log.
         max_steps: Local-step step limit, including speculative prefetch.
 
@@ -818,7 +815,6 @@ def build_distributed_dataloader(
             cost_model=cost_model,
             balancing_algorithm=balancing_algorithm,
             device=device,
-            move_fn=move_fn,
             bin_stats_fn=bin_stats_fn,
             max_steps=max_steps,
         )
@@ -836,7 +832,6 @@ def build_distributed_dataloader(
         model_config=model_config,
         cost_model=cost_model,
         balancing_algorithm=balancing_algorithm,
-        move_fn=move_fn,
     )
 
 
@@ -855,7 +850,6 @@ def _build_distributed_dataloader_impl(
         model_config: Any = None,
         cost_model: CostModel | None = None,
         balancing_algorithm: BalancingAlgorithm | None = None,
-        move_fn: Callable[[Any, Any], Any] | None = None,
 ) -> DistributedDataLoader:
     if communication_device is None:
         communication_device = _resolve_device(communication_backend=getattr(config, "communication_backend", "hccl"))
@@ -879,7 +873,7 @@ def _build_distributed_dataloader_impl(
         balancing_algorithm=balancing_algorithm,
     )
     device = _resolve_device(communication_device)
-    device_prefetch = _create_device_prefetcher(device, move_fn)
+    device_prefetch = _create_device_prefetcher(device)
     state.communication_device = device
 
     _synchronize_build_state(state, config)
