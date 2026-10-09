@@ -16,6 +16,7 @@
 
 import inspect
 import unittest
+from contextlib import nullcontext
 from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -151,8 +152,12 @@ class TestDistributedDataBuildState(unittest.TestCase):
         """Return a standalone mesh that needs no distributed initialization."""
         return SimpleNamespace(mesh_shape=(1,), mesh_dim_names=("dp",), rank_list=(0,))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_sampler_modes_report_reader_roles(self) -> None:
-        """Sampler online and metadata modes retain their distinct payload ownership."""
+        """Feature: Dataset Reader construction.
+        Description: Build native sampler loaders in online and metadata modes.
+        Expectation: Both modes report the Dataset length and yield the sampled data.
+        """
         samples = [0, 1]
         metadata = [SampleMetadata(pack_tokens=4, sample_id=index) for index in samples]
         for metadata_mode in (False, True):
@@ -174,12 +179,64 @@ class TestDistributedDataBuildState(unittest.TestCase):
                 status = preflight.call_args.kwargs
                 self.assertTrue(status["is_reader"])
                 self.assertEqual(status["reader_size"], len(samples))
-                self.assertEqual(status["is_direct_reader"], metadata_mode)
-                self.assertEqual(status["direct_dataset_size"], len(samples) if metadata_mode else None)
                 self.assertFalse(status["dataset_already_sharded"])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_metadata_length_mismatch_raises_before_preflight(self) -> None:
+        """Feature: Local metadata alignment.
+        Description: Supply fewer metadata entries than Dataset samples.
+        Expectation: The builder rejects the mismatch before starting collectives.
+        """
+        sampler = build_dataset_batch_sampler(
+            total_samples=2, micro_batch_size=1, global_batch_size=1, dp_world_size=1, dp_rank=0,
+        )
+        with patch("hyper_parallel.distributed_data.api.synchronize_build_preflight") as preflight:
+            with self.assertRaisesRegex(ValueError, "metadata must align with the mapping Dataset"):
+                build_distributed_dataloader(
+                    [0, 1], self._mesh(),
+                    DistributedDatasetConfig(seq_len=8, local_batch_size=1, metadata_mode=True),
+                    batch_sampler=sampler, metadata=[SampleMetadata(1)], device="cpu",
+                    cost_model=lambda metadata: metadata.cost,
+                )
+            preflight.assert_not_called()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_preflight_checks_dataset_sizes_and_sharding(self) -> None:
+        """Feature: Shared Dataset index space.
+        Description: Compare reader lengths and sharding modes with a non-reader present.
+        Expectation: Both loading modes accept matching readers and reject inconsistent inputs.
+        """
+        cases = ((2, False, None), (3, False, "length mismatch"), (2, True, "sharding mode differs"))
+        for metadata_mode in (False, True):
+            for remote_size, remote_sharded, error in cases:
+                with self.subTest(metadata_mode=metadata_mode, error=error), patch(
+                        "hyper_parallel.distributed_data.transport.dist",
+                ) as distributed, patch(
+                        "hyper_parallel.distributed_data.transport.all_gather_control_object",
+                        return_value=[
+                            (0, "layout", True, 2, False),
+                            (1, "layout", True, remote_size, remote_sharded),
+                            (2, "layout", False, None, False),
+                        ],
+                ):
+                    distributed.is_available.return_value = True
+                    distributed.is_initialized.return_value = True
+                    distributed.get_rank.return_value = 0
+                    distributed.get_world_size.return_value = 3
+                    expected = self.assertRaisesRegex(ValueError, error) if error else nullcontext()
+                    with expected:
+                        synchronize_build_preflight(
+                            build_fingerprint="layout", is_reader=True, reader_size=2,
+                            metadata_mode=metadata_mode, dataset_already_sharded=False,
+                            communication_backend="gloo",
+                        )
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_invalid_config_raises_before_preflight_or_group_creation(self) -> None:
-        """Invalid configuration errors are raised directly at the build site."""
+        """Feature: Local configuration validation.
+        Description: Supply invalid configuration objects to the builder.
+        Expectation: Errors are raised before preflight or group creation.
+        """
         for config in (None, {}, object()):
             with self.subTest(config=config), patch(
                     "hyper_parallel.distributed_data.api.synchronize_build_preflight",
@@ -190,8 +247,12 @@ class TestDistributedDataBuildState(unittest.TestCase):
                 preflight.assert_not_called()
                 create_groups.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_partial_build_failures_raise_before_preflight_or_group_creation(self) -> None:
-        """Local option and metadata errors are raised without error synchronization."""
+        """Feature: Local builder input validation.
+        Description: Supply invalid loader options, devices, and metadata combinations.
+        Expectation: Local errors are raised before preflight or group creation.
+        """
         cases = (
             ({"dataloader_kwargs": {"num_workers": -1}, "metadata_fn": lambda _: SampleMetadata(1)},
              "num_workers", False),
@@ -214,8 +275,12 @@ class TestDistributedDataBuildState(unittest.TestCase):
                     preflight.assert_not_called()
                     create_groups.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_metadata_mode_requires_the_configured_metadata_source(self) -> None:
-        """Metadata source arguments must agree with the explicit config mode."""
+        """Feature: Explicit metadata mode.
+        Description: Supply metadata sources that conflict with the configured mode.
+        Expectation: The builder rejects each incompatible or missing source.
+        """
         metadata = [SampleMetadata(pack_tokens=1), SampleMetadata(pack_tokens=1)]
         cases = (
             (

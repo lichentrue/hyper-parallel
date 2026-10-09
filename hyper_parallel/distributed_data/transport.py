@@ -201,8 +201,6 @@ def synchronize_build_preflight(
         build_fingerprint: str | None,
         is_reader: bool,
         reader_size: int | None,
-        is_direct_reader: bool,
-        direct_dataset_size: int | None,
         metadata_mode: bool,
         dataset_already_sharded: bool,
         communication_backend: str = "hccl",
@@ -213,10 +211,8 @@ def synchronize_build_preflight(
     Args:
         build_fingerprint: Stable topology and configuration identity.
         is_reader: Whether this WORLD rank is configured as a Dataset Reader.
-        reader_size: Dataset length in online mode or metadata length in
-            metadata mode on Dataset Reader ranks.
-        is_direct_reader: Whether this rank reads samples selected from metadata.
-        direct_dataset_size: Mapping-Dataset length on plan-aware reader ranks.
+        reader_size: Dataset length on Dataset Reader ranks. In metadata mode,
+            the builder has already checked that the metadata length matches.
         metadata_mode: Rank-local choice of whether metadata is available before
             sample reads. The caller's config controls this directly; the mode
             is not resolved or exchanged during preflight.
@@ -224,8 +220,7 @@ def synchronize_build_preflight(
             local sample and metadata stream.
 
     Raises:
-        ValueError: If build inputs differ or Dataset Readers and direct readers
-            do not expose one consistent logical index space.
+        ValueError: If build inputs or Dataset lengths differ across ranks.
     """
     distributed = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if distributed else 0
@@ -238,8 +233,6 @@ def synchronize_build_preflight(
         build_fingerprint,
         is_reader,
         reader_size,
-        is_direct_reader,
-        direct_dataset_size,
         dataset_already_sharded,
     )
     if not distributed:
@@ -262,14 +255,6 @@ def synchronize_build_preflight(
         metadata_mode=metadata_mode,
         dataset_already_sharded=dataset_already_sharded,
     )
-    direct_reader_sizes = [(item[0], item[5]) for item in gathered if item[4]]
-    _validate_direct_reader_sizes(direct_reader_sizes, dataset_already_sharded=dataset_already_sharded)
-    _validate_metadata_size_alignment(
-        dataset_reader_sizes,
-        direct_reader_sizes,
-        metadata_mode=metadata_mode,
-        dataset_already_sharded=dataset_already_sharded,
-    )
 
 
 def _validate_build_fingerprint(normalized: Sequence[tuple[Any, ...]]) -> None:
@@ -282,7 +267,7 @@ def _validate_build_fingerprint(normalized: Sequence[tuple[Any, ...]]) -> None:
 
 def _validate_build_sharding_modes(normalized: Sequence[tuple[Any, ...]]) -> None:
     """Reject incompatible Dataset Reader sharding settings across ranks."""
-    sharding_modes = {item[6] for item in normalized}
+    sharding_modes = {item[4] for item in normalized}
     if len(sharding_modes) != 1:
         raise ValueError("Distributed DataLoader Dataset sharding mode differs across WORLD ranks.")
 
@@ -309,57 +294,6 @@ def _validate_dataset_reader_sizes(
         reader_data_name = "Metadata" if metadata_mode else "Dataset"
         raise ValueError(
             f"{reader_data_name} length mismatch across Dataset Reader ranks: {dataset_reader_sizes}."
-        )
-
-
-def _validate_direct_reader_sizes(
-        direct_reader_sizes: Sequence[tuple[int, int | None]],
-        *,
-        dataset_already_sharded: bool,
-) -> None:
-    invalid_direct_reader_sizes = [
-        (reader_rank, size)
-        for reader_rank, size in direct_reader_sizes
-        if not isinstance(size, int) or isinstance(size, bool) or size < 0
-    ]
-    if invalid_direct_reader_sizes:
-        raise ValueError(f"Direct-reader Dataset length is invalid on ranks {invalid_direct_reader_sizes}.")
-    if not dataset_already_sharded and len({size for _, size in direct_reader_sizes}) > 1:
-        raise ValueError(f"Direct-reader Dataset length mismatch across constructor ranks: {direct_reader_sizes}.")
-
-
-def _validate_metadata_size_alignment(
-        dataset_reader_sizes: Sequence[tuple[int, int | None]],
-        direct_reader_sizes: Sequence[tuple[int, int | None]],
-        *,
-        metadata_mode: bool,
-        dataset_already_sharded: bool,
-) -> None:
-    if not metadata_mode:
-        return
-    if dataset_already_sharded:
-        metadata_sizes = dict(dataset_reader_sizes)
-        sample_sizes = dict(direct_reader_sizes)
-        aligned = metadata_sizes.keys() == sample_sizes.keys() and all(
-            metadata_sizes[rank] == sample_sizes[rank] for rank in metadata_sizes
-        )
-        if not aligned:
-            raise ValueError(
-                "Pre-sharded metadata and Dataset lengths must match on each Dataset Reader rank, "
-                f"but got metadata_readers={dataset_reader_sizes}, sample_readers={direct_reader_sizes}."
-            )
-        return
-    dataset_reader_lengths = {size for _, size in dataset_reader_sizes}
-    direct_reader_lengths = {size for _, size in direct_reader_sizes}
-    aligned = (
-        len(dataset_reader_lengths) == 1
-        and len(direct_reader_lengths) == 1
-        and dataset_reader_lengths == direct_reader_lengths
-    )
-    if not aligned:
-        raise ValueError(
-            f"Metadata and direct-reader Dataset lengths must match, but got "
-            f"dataset_readers={dataset_reader_sizes}, direct_readers={direct_reader_sizes}."
         )
 
 

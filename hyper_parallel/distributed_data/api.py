@@ -413,7 +413,6 @@ class _BuildState:
     config_fingerprint: str | None = None
     communication_device: torch.device | None = None
     reader_size: int | None = None
-    direct_dataset_size: int | None = None
 
     @property
     def is_reader(self) -> bool:
@@ -503,7 +502,6 @@ def _configure_batch_sampler_sources(
         if not callable(getattr(metadata, "__getitem__", None)) or len(metadata) != len(dataset):
             raise ValueError("Native batch_sampler metadata must align with the mapping Dataset.")
         state.direct_sample_loader = sample_loader
-        state.direct_dataset_size = len(dataset)
     elif metadata_fn is None:
         raise ValueError("Native batch_sampler online mode requires metadata_fn.")
     reader = BatchSamplerReader(
@@ -666,13 +664,10 @@ def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfi
     # are raised directly by the caller.
     dataset_already_sharded = isinstance(config, DistributedDatasetConfig) and config.dataset_already_sharded
     metadata_mode = getattr(config, "metadata_mode", False)
-    is_direct_reader = metadata_mode and state.topology is not None and state.topology.is_constructor
     synchronize_build_preflight(
         build_fingerprint=build_fingerprint,
         is_reader=state.is_reader,
         reader_size=state.reader_size,
-        is_direct_reader=is_direct_reader,
-        direct_dataset_size=state.direct_dataset_size,
         metadata_mode=metadata_mode,
         dataset_already_sharded=dataset_already_sharded,
         communication_backend=getattr(config, "communication_backend", "hccl"),
